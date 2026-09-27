@@ -319,7 +319,7 @@ class QwenGGUFInference:
             },
             "optional": {
                 "image": ("IMAGE",),
-                "video": ("IMAGE",),
+                "video": ("VIDEO",),
                 "parameters": ("QWEN_GGUF_PARAMETERS",),
             },
         }
@@ -341,14 +341,23 @@ class QwenGGUFInference:
                 raise ValueError(f"Unknown inference parameters: {sorted(unknown)}")
             params.update(parameters)
         if image is not None and video is not None:
-            raise ValueError("Connect either image or video IMAGE input, not both.")
+            raise ValueError("Connect either image or video input, not both.")
         if params["max_frames"] < 1 or params["max_size"] < 0 or params["video_fps"] < 0:
             raise ValueError("max_frames must be positive; max_size and video_fps cannot be negative.")
-        media = video if video is not None else image
-        frame_rate = float(params["video_fps"]) if video is not None and params["video_fps"] else None
+        media = image
+        frame_rate = float(params["video_fps"]) if image is not None and params["video_fps"] else None
+        if video is not None:
+            if not callable(getattr(video, "get_components", None)):
+                raise TypeError("video input must be a ComfyUI VIDEO with get_components().")
+            components = video.get_components()
+            media = components.images
+            frame_rate = float(components.frame_rate)
+            if frame_rate <= 0:
+                raise ValueError("VIDEO frame rate must be positive.")
         selected = _select_frames(media, params["max_frames"]) if media is not None else None
         selected_count = len(selected) if selected is not None else 0
-        mode = _mode(selected_count, params, context_size, video is not None)
+        is_video_sequence = video is not None or frame_rate is not None or params["inference_mode"] == "video"
+        mode = _mode(selected_count, params, context_size, is_video_sequence)
         model_path = _model_path(model)
         mmproj_path = None if mmproj == "None" else _model_path(mmproj)
         if media is not None and mmproj_path is None:
@@ -387,12 +396,12 @@ class QwenGGUFInference:
                     for index, frame in selected:
                         label = (f"Frame {index + 1} ({index / frame_rate:.2f}s)"
                                  if frame_rate is not None else
-                                 f"Frame {index + 1}" if video is not None else f"Image {index + 1}")
+                                 f"Frame {index + 1}" if is_video_sequence else f"Image {index + 1}")
                         frame_prompt = (f"{prompt}\n\nDescribe only {label}. Keep the visible observations "
                                         "concise; do not infer events outside this frame.")
                         frame_messages = _messages(system_prompt, frame_prompt, [(index, frame)],
                                                    params["max_size"], frame_rate,
-                                                   as_video=video is not None)
+                                                   as_video=is_video_sequence)
                         frame_result = llm.create_chat_completion(
                             messages=frame_messages, max_tokens=min(params["max_tokens"], 256),
                             **completion_options,
