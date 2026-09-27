@@ -49,6 +49,7 @@ class FakeTensor:
 
 class FakeLlama:
     instances = []
+    calls = []
     response = {"choices": [{"message": {"content": "two images"}}],
                 "usage": {"completion_tokens": 3}}
 
@@ -61,6 +62,7 @@ class FakeLlama:
     def create_chat_completion(self, **kwargs):
         self.completion_kwargs = kwargs
         self.messages = kwargs["messages"]
+        self.calls.append(kwargs)
         return self.response
 
     def close(self):
@@ -131,6 +133,7 @@ class QwenNodeTests(unittest.TestCase):
     def setUp(self):
         self.nodes._close_model()
         FakeLlama.instances.clear()
+        FakeLlama.calls.clear()
         FakeHandler.instances.clear()
         FakeLlama.response = {"choices": [{"message": {"content": "two images"}}],
                               "usage": {"completion_tokens": 3}}
@@ -143,7 +146,10 @@ class QwenNodeTests(unittest.TestCase):
         self.assertEqual(options["attention_mode"][0], ["auto", "on", "off"])
         self.assertIn("Prompt Style - Cinematic", options["preset_prompt"][0])
         self.assertIn("parameters", self.nodes.QwenGGUFInference.INPUT_TYPES()["optional"])
+        self.assertIn("video", self.nodes.QwenGGUFInference.INPUT_TYPES()["optional"])
         self.assertTrue(options["seed"][1]["control_after_generate"])
+        param_names = list(self.nodes.QwenGGUFParameters.INPUT_TYPES()["required"])
+        self.assertEqual(param_names[:2], ["enable_thinking", "reasoning_budget"])
 
     def base_options(self, mmproj="None"):
         return dict(model=str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), mmproj=mmproj,
@@ -151,7 +157,8 @@ class QwenNodeTests(unittest.TestCase):
 
     def parameter_options(self):
         required = self.nodes.QwenGGUFParameters.INPUT_TYPES()["required"]
-        return {name: spec[1]["default"] for name, spec in required.items()}
+        return {name: spec[1]["default"] if len(spec) > 1 else spec[0][0]
+                for name, spec in required.items()}
 
     def test_batch_is_one_ordered_multimodal_request(self):
         pixels = np.zeros((2, 2, 2, 3), dtype=np.float32)
@@ -221,7 +228,7 @@ class QwenNodeTests(unittest.TestCase):
         params.update(top_p=0.8, top_k=50, min_p=0.1, typical_p=0.7,
                       repeat_penalty=1.2, frequency_penalty=0.4,
                       presence_penalty=0.3, mirostat_mode=2, n_batch=1024,
-                      n_threads=4, image_max_tokens=600, max_images=2,
+                      n_threads=4, image_max_tokens=600, max_frames=2,
                       enable_thinking=True, reasoning_budget=80)
         bundle = self.nodes.QwenGGUFParameters().build(**params)[0]
         options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
@@ -263,6 +270,50 @@ class QwenNodeTests(unittest.TestCase):
         params["enable_thinking"] = True
         with self.assertRaisesRegex(ValueError, "requires mmproj"):
             self.nodes.QwenGGUFInference().infer(**options, parameters=params)
+
+    def test_video_frames_are_sampled_timestamped_and_resized(self):
+        frames = FakeTensor(np.zeros((5, 4, 8, 3), dtype=np.float32))
+        video = types.SimpleNamespace(get_components=lambda: types.SimpleNamespace(
+            images=frames, frame_rate=2))
+        params = self.parameter_options()
+        params.update(inference_mode="all at once", max_frames=3, max_size=2)
+        options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
+        answer, _, stats = self.nodes.QwenGGUFInference().infer(
+            **options, video=video, parameters=params)
+        self.assertEqual(answer, "two images")
+        self.assertIn('"selected_frames": 3', stats)
+        content = FakeLlama.calls[0]["messages"][-1]["content"]
+        self.assertEqual([item["text"] for item in content if item["type"] == "text"][1:],
+                         ["Frame 1 (0.00s):", "Frame 3 (1.00s):", "Frame 5 (2.00s):"])
+        urls = [item["image_url"]["url"] for item in content if item["type"] == "image_url"]
+        image = Image.open(io.BytesIO(base64.b64decode(urls[0].split(",", 1)[1])))
+        self.assertEqual(max(image.size), 2)
+
+    def test_one_by_one_summarizes_frame_observations(self):
+        params = self.parameter_options()
+        params.update(inference_mode="one by one", max_frames=2)
+        options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
+        options.update(image=FakeTensor(np.zeros((4, 2, 2, 3), dtype=np.float32)),
+                       parameters=params)
+        _, _, stats = self.nodes.QwenGGUFInference().infer(**options)
+        self.assertEqual(len(FakeLlama.calls), 3)
+        self.assertIn("Image 1: two images", FakeLlama.calls[-1]["messages"][-1]["content"])
+        self.assertIn("Image 4: two images", FakeLlama.calls[-1]["messages"][-1]["content"])
+        self.assertIn('"inference_mode": "one_by_one"', stats)
+        self.assertIn('"model_calls": 3', stats)
+
+    def test_auto_mode_uses_frame_count_and_context(self):
+        params = self.parameter_options()
+        self.assertEqual(self.nodes._mode(2, params, 8192), "all_at_once")
+        self.assertEqual(self.nodes._mode(12, params, 8192), "one_by_one")
+        self.assertEqual(self.nodes._mode(4, params, 512), "one_by_one")
+
+    def test_image_and_video_are_exclusive(self):
+        frames = FakeTensor(np.zeros((1, 2, 2, 3), dtype=np.float32))
+        video = types.SimpleNamespace(get_components=lambda: types.SimpleNamespace(
+            images=frames, frame_rate=24))
+        with self.assertRaisesRegex(ValueError, "either IMAGE or VIDEO"):
+            self.nodes.QwenGGUFInference().infer(**self.base_options(), image=frames, video=video)
 
 
 if __name__ == "__main__":

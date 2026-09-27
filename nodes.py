@@ -47,7 +47,8 @@ PARAMETER_DEFAULTS = {
     "frequency_penalty": 0.0, "presence_penalty": 0.0,
     "mirostat_mode": 0, "mirostat_eta": 0.10, "mirostat_tau": 5.0,
     "enable_thinking": False, "reasoning_budget": -1,
-    "max_images": 0, "image_max_tokens": -1,
+    "inference_mode": "auto", "max_frames": 24, "max_size": 256,
+    "image_max_tokens": -1,
     "n_batch": 512, "n_threads": 0,
     "mtp_draft_tokens": 0, "mtp_draft_p_min": 0.0,
 }
@@ -149,7 +150,7 @@ def _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_m
     return model
 
 
-def _image_data_url(frame):
+def _image_data_url(frame, max_size=0):
     if frame.ndim != 3 or frame.shape[-1] not in (1, 3, 4):
         raise ValueError("IMAGE must have shape [batch, height, width, 1/3/4 channels].")
     array = (frame.detach().cpu().clamp(0, 1) * 255).byte().numpy()
@@ -157,36 +158,72 @@ def _image_data_url(frame):
     if image.mode == "RGBA":
         image = Image.alpha_composite(Image.new("RGBA", image.size, "white"), image)
     image = image.convert("RGB")
+    if max_size and max(image.size) > max_size:
+        image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
     with io.BytesIO() as buffer:
         image.save(buffer, format="PNG")
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
 
 
-def _messages(system_prompt, user_prompt, image, max_images=0):
-    messages = []
-    if system_prompt.strip():
-        messages.append({"role": "system", "content": system_prompt})
-    if image is None:
-        messages.append({"role": "user", "content": user_prompt})
-        return messages
-
+def _select_frames(image, max_frames):
     if image.ndim != 4 or image.shape[0] == 0:
-        raise ValueError("IMAGE must be a non-empty [batch, height, width, channels] tensor.")
+        raise ValueError("IMAGE or VIDEO frames must be a non-empty [batch, height, width, channels] tensor.")
     total = image.shape[0]
-    count = min(total, max_images) if max_images else total
+    count = min(total, max_frames)
     indices = ([0] if count == 1 else
                [round(position * (total - 1) / (count - 1)) for position in range(count)])
     selected = set(indices)
+    return [(index, frame) for index, frame in enumerate(image) if index in selected]
+
+
+def _messages(system_prompt, user_prompt, frames=None, max_size=0, frame_rate=None):
+    messages = []
+    if system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt})
+    if frames is None:
+        messages.append({"role": "user", "content": user_prompt})
+        return messages
+
     content = [{"type": "text", "text": user_prompt}]
-    for index, frame in enumerate(image):
-        if index not in selected:
-            continue
-        if count > 1:
+    for index, frame in frames:
+        if frame_rate is not None:
+            content.append({"type": "text", "text": f"Frame {index + 1} ({index / frame_rate:.2f}s):"})
+        elif len(frames) > 1:
             content.append({"type": "text", "text": f"Image {index + 1}:"})
-        content.append({"type": "image_url", "image_url": {"url": _image_data_url(frame)}})
+        content.append({"type": "image_url", "image_url": {"url": _image_data_url(frame, max_size)}})
     messages.append({"role": "user", "content": content})
     return messages
+
+
+def _response_parts(result):
+    try:
+        message = result["choices"][0]["message"]
+        answer = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        if isinstance(answer, list):
+            answer = "".join(part.get("text", "") for part in answer if isinstance(part, dict))
+        if not isinstance(answer, str) or not isinstance(reasoning, str):
+            raise ValueError("non-text response")
+        if "<think>" in answer and "</think>" in answer:
+            prefix, rest = answer.split("<think>", 1)
+            thought, suffix = rest.split("</think>", 1)
+            reasoning = reasoning or thought.strip()
+            answer = (prefix + suffix).strip()
+        return answer, reasoning
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise RuntimeError(f"Unexpected llama-cpp-python response: {str(result)[:1000]}") from error
+
+
+def _mode(selected_count, params, context_size):
+    requested = params["inference_mode"].replace(" ", "_")
+    if requested not in ("auto", "all_at_once", "one_by_one"):
+        raise ValueError(f"Unknown inference_mode: {requested!r}")
+    if requested != "auto":
+        return requested
+    estimated_image_tokens = params["image_max_tokens"] if params["image_max_tokens"] > 0 else 512
+    return "all_at_once" if (selected_count <= 8 and
+                             selected_count * estimated_image_tokens <= context_size * 0.6) else "one_by_one"
 
 
 def _prompt_with_preset(preset_prompt, user_prompt):
@@ -202,6 +239,11 @@ class QwenGGUFParameters:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
+            "enable_thinking": ("BOOLEAN", {"default": False}),
+            "reasoning_budget": ("INT", {"default": -1, "min": -1, "max": 32768}),
+            "inference_mode": (["auto", "all at once", "one by one"],),
+            "max_frames": ("INT", {"default": 24, "min": 1, "max": 1024}),
+            "max_size": ("INT", {"default": 256, "min": 0, "max": 4096}),
             "max_tokens": ("INT", {"default": 1024, "min": 1, "max": 32768}),
             "top_k": ("INT", {"default": 30, "min": 0, "max": 1000}),
             "top_p": ("FLOAT", {"default": 0.90, "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -214,9 +256,6 @@ class QwenGGUFParameters:
             "mirostat_mode": ("INT", {"default": 0, "min": 0, "max": 2}),
             "mirostat_eta": ("FLOAT", {"default": 0.10, "min": 0.001, "max": 1.0, "step": 0.01}),
             "mirostat_tau": ("FLOAT", {"default": 5.0, "min": 0.1, "max": 20.0, "step": 0.1}),
-            "enable_thinking": ("BOOLEAN", {"default": False}),
-            "reasoning_budget": ("INT", {"default": -1, "min": -1, "max": 32768}),
-            "max_images": ("INT", {"default": 0, "min": 0, "max": 1024}),
             "image_max_tokens": ("INT", {"default": -1, "min": -1, "max": 16384}),
             "n_batch": ("INT", {"default": 512, "min": 32, "max": 8192}),
             "n_threads": ("INT", {"default": 0, "min": 0, "max": 128}),
@@ -252,7 +291,11 @@ class QwenGGUFInference:
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffff, "control_after_generate": True}),
             },
-            "optional": {"image": ("IMAGE",), "parameters": ("QWEN_GGUF_PARAMETERS",)},
+            "optional": {
+                "image": ("IMAGE",),
+                "video": ("VIDEO",),
+                "parameters": ("QWEN_GGUF_PARAMETERS",),
+            },
         }
 
     RETURN_TYPES = ("STRING", "STRING", "STRING")
@@ -262,7 +305,7 @@ class QwenGGUFInference:
 
     def infer(self, model, mmproj, user_prompt, system_prompt, preset_prompt="Normal - Describe",
               attention_mode="auto", context_size=8192, gpu_layers=99,
-              keep_model_loaded=True, seed=0, image=None, parameters=None):
+              keep_model_loaded=True, seed=0, image=None, video=None, parameters=None):
         if parameters is not None and not isinstance(parameters, dict):
             raise TypeError("parameters must come from a Qwen GGUF Parameters node.")
         params = dict(PARAMETER_DEFAULTS)
@@ -271,19 +314,45 @@ class QwenGGUFInference:
             if unknown:
                 raise ValueError(f"Unknown inference parameters: {sorted(unknown)}")
             params.update(parameters)
+        if image is not None and video is not None:
+            raise ValueError("Connect either IMAGE or VIDEO, not both.")
+        if params["max_frames"] < 1 or params["max_size"] < 0:
+            raise ValueError("max_frames must be positive and max_size cannot be negative.")
+        frame_rate = None
+        media = image
+        if video is not None:
+            if not callable(getattr(video, "get_components", None)):
+                raise TypeError("VIDEO input must be a ComfyUI VideoInput with get_components().")
+            components = video.get_components()
+            media = components.images
+            frame_rate = float(components.frame_rate)
+            if frame_rate <= 0:
+                raise ValueError("VIDEO frame rate must be positive.")
+        selected = _select_frames(media, params["max_frames"]) if media is not None else None
+        selected_count = len(selected) if selected is not None else 0
+        mode = _mode(selected_count, params, context_size)
         model_path = _model_path(model)
         mmproj_path = None if mmproj == "None" else _model_path(mmproj)
-        if image is not None and mmproj_path is None:
-            raise ValueError("Image input requires the matching mmproj GGUF file.")
+        if media is not None and mmproj_path is None:
+            raise ValueError("IMAGE or VIDEO input requires the matching mmproj GGUF file.")
         if params["enable_thinking"] and mmproj_path is None:
             raise ValueError("enable_thinking requires mmproj: the Qwen35ChatHandler controls this template option.")
         if params["mtp_draft_tokens"] >= params["n_batch"]:
             raise ValueError("mtp_draft_tokens must be smaller than n_batch.")
 
-        messages = _messages(
-            system_prompt, _prompt_with_preset(preset_prompt, user_prompt),
-            image, params["max_images"],
+        prompt = _prompt_with_preset(preset_prompt, user_prompt)
+        completion_options = dict(
+            temperature=params["temperature"], top_p=params["top_p"],
+            top_k=params["top_k"], min_p=params["min_p"],
+            typical_p=params["typical_p"], repeat_penalty=params["repeat_penalty"],
+            frequency_penalty=params["frequency_penalty"],
+            presence_penalty=params["presence_penalty"],
+            mirostat_mode=params["mirostat_mode"],
+            mirostat_tau=params["mirostat_tau"], mirostat_eta=params["mirostat_eta"],
+            reasoning_budget=params["reasoning_budget"] if params["enable_thinking"] else -1,
+            seed=seed,
         )
+        results = []
         with _LOCK:
             try:
                 llm = _ensure_model(
@@ -294,38 +363,45 @@ class QwenGGUFInference:
                     mtp_draft_tokens=params["mtp_draft_tokens"],
                     mtp_draft_p_min=params["mtp_draft_p_min"],
                 )
+                if mode == "one_by_one" and selected_count > 1:
+                    observations = []
+                    for index, frame in selected:
+                        label = (f"Frame {index + 1} ({index / frame_rate:.2f}s)"
+                                 if frame_rate is not None else f"Image {index + 1}")
+                        frame_prompt = (f"{prompt}\n\nDescribe only {label}. Keep the visible observations "
+                                        "concise; do not infer events outside this frame.")
+                        frame_messages = _messages(system_prompt, frame_prompt, [(index, frame)],
+                                                   params["max_size"], frame_rate)
+                        frame_result = llm.create_chat_completion(
+                            messages=frame_messages, max_tokens=min(params["max_tokens"], 256),
+                            **completion_options,
+                        )
+                        results.append(frame_result)
+                        observation, _ = _response_parts(frame_result)
+                        observations.append(f"{label}: {observation[:800]}")
+                    summary_prompt = (f"{prompt}\n\nThe following are observations from ordered "
+                                      "frames/images. Answer the original request using them. "
+                                      "Distinguish visible changes from uncertain motion or unseen events.\n\n" +
+                                      "\n".join(observations))
+                    messages = _messages(system_prompt, summary_prompt)
+                else:
+                    messages = _messages(system_prompt, prompt, selected,
+                                         params["max_size"], frame_rate)
                 result = llm.create_chat_completion(
-                    messages=messages, max_tokens=params["max_tokens"],
-                    temperature=params["temperature"], top_p=params["top_p"],
-                    top_k=params["top_k"], min_p=params["min_p"],
-                    typical_p=params["typical_p"],
-                    repeat_penalty=params["repeat_penalty"],
-                    frequency_penalty=params["frequency_penalty"],
-                    presence_penalty=params["presence_penalty"],
-                    mirostat_mode=params["mirostat_mode"],
-                    mirostat_tau=params["mirostat_tau"], mirostat_eta=params["mirostat_eta"],
-                    reasoning_budget=params["reasoning_budget"] if params["enable_thinking"] else -1,
-                    seed=seed,
+                    messages=messages, max_tokens=params["max_tokens"], **completion_options,
                 )
+                results.append(result)
                 spec_stats = getattr(llm, "last_speculative_stats", {}) if params["mtp_draft_tokens"] else {}
             finally:
                 if not keep_model_loaded:
                     _close_model()
 
-        try:
-            message = result["choices"][0]["message"]
-            answer = message.get("content") or ""
-            reasoning = message.get("reasoning_content") or ""
-            if isinstance(answer, list):
-                answer = "".join(part.get("text", "") for part in answer if isinstance(part, dict))
-            if not isinstance(answer, str) or not isinstance(reasoning, str):
-                raise ValueError("non-text response")
-            if "<think>" in answer and "</think>" in answer:
-                prefix, rest = answer.split("<think>", 1)
-                thought, suffix = rest.split("</think>", 1)
-                reasoning = reasoning or thought.strip()
-                answer = (prefix + suffix).strip()
-            stats = {"usage": result.get("usage", {}), "mtp": spec_stats}
-            return (answer, reasoning, json.dumps(stats, ensure_ascii=False, default=str))
-        except (KeyError, IndexError, TypeError, ValueError) as error:
-            raise RuntimeError(f"Unexpected llama-cpp-python response: {str(result)[:1000]}") from error
+        answer, reasoning = _response_parts(result)
+        usage = {}
+        for item in results:
+            for key, value in item.get("usage", {}).items():
+                if isinstance(value, (int, float)):
+                    usage[key] = usage.get(key, 0) + value
+        stats = {"usage": usage, "mtp": spec_stats, "inference_mode": mode,
+                 "selected_frames": selected_count, "model_calls": len(results)}
+        return (answer, reasoning, json.dumps(stats, ensure_ascii=False, default=str))

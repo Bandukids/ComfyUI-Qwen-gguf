@@ -1,6 +1,6 @@
 # ComfyUI Qwen 3.5+ GGUF
 
-一个精简的 ComfyUI 扩展，用本地 GGUF 模型运行 Qwen 3.5 及后续版本的文本或图像推理。一个推理节点可独立使用，也可连接一个参数节点调节高级设置；不下载模型，不安装 Transformers，也不支持早期 Qwen 模型。
+一个精简的 ComfyUI 扩展，用本地 GGUF 模型运行 Qwen 3.5 及后续版本的文本、图片批次或视频帧推理。一个推理节点可独立使用，也可连接一个参数节点调节高级设置；不下载模型，不安装 Transformers，也不支持早期 Qwen 模型。
 
 ## 准备
 
@@ -12,9 +12,9 @@
 
 ## 节点用法
 
-添加 **Qwen 3.5+ GGUF Inference**。它接受可选的 `IMAGE` 批次、提示词预设、用户提示词和系统提示词，输出 `response`、`reasoning` 和 `stats_json`。预设指令会放在用户提示词之前；选 `Empty - Nothing` 时只使用用户提示词。`stats_json` 包含返回的 token 用量，以及启用 MTP 时可用的推测解码统计。
+添加 **Qwen 3.5+ GGUF Inference**。它接受可选的 `IMAGE` 批次或原生 `VIDEO` 输入、提示词预设、用户提示词和系统提示词。`IMAGE` 与 `VIDEO` 两者只能连接一个。输出为 `response`、`reasoning` 和 `stats_json`。预设指令会放在用户提示词之前；选 `Empty - Nothing` 时只使用用户提示词。`stats_json` 包含 token 用量、实际推理模式、取样帧数、模型调用次数，以及启用 MTP 时可用的推测解码统计。
 
-ComfyUI 的 `IMAGE` 是 `[B,H,W,C]`；当 `B>1` 时，节点把整批图片按顺序放进**同一次请求**，适合比较图片或综合描述，输出一段文字。视频加载节点输出的图片帧批次也可以接到这个输入，但当前节点不会按时间戳处理视频。所有图片会无损编码为 PNG；大图或大批次可能需要提高 `context_size`。
+ComfyUI 的 `IMAGE` 是 `[B,H,W,C]`，图片批次保留顺序。原生 `VIDEO` 输入会读取视频帧和帧率，均匀选取最多 `max_frames` 帧，并在提示中标注相对时间戳。帧会先按 `max_size` 限制最长边，再编码为 PNG。音轨不参与推理；这套 Qwen3.5 处理器目前不接受原生视频媒体消息，因此这里使用带时间戳的帧图像。ComfyUI 的 `get_components()` 会先解码整个视频，处理长视频前建议先用 **Trim Video** 缩短片段。
 
 推理节点保留 `seed`、`attention_mode`、`context_size`、`gpu_layers` 和 `keep_model_loaded`。`seed` 支持 ComfyUI 的“生成后控制”选项。`attention_mode` 控制 llama.cpp 的 Flash Attention，仅有 `auto`、`on`、`off`；它不对应 PyTorch 的 SageAttention、FlashAttention 2 或 SDPA。关闭 `keep_model_loaded` 会在本次推理结束后释放模型。量化等级由选择的 GGUF 文件决定，因此没有单独的量化控件。
 
@@ -22,7 +22,7 @@ ComfyUI 的 `IMAGE` 是 `[B,H,W,C]`；当 `B>1` 时，节点把整批图片按�
 
 ## Parameters 节点
 
-需要调参时，添加 **Qwen GGUF Parameters**，把其 `parameters` 输出连接到推理节点的可选 `parameters` 输入。不连接时使用文档中的默认值。一个参数节点也可以连接多个推理节点。
+需要调参时，添加 **Qwen GGUF Parameters**，把其 `parameters` 输出连接到推理节点的可选 `parameters` 输入。不连接时使用内置默认值。一个参数节点也可以连接多个推理节点。`enable_thinking` 与 `reasoning_budget` 位于参数节点顶部。
 
 从旧版 `Qwen 3.5+ GGUF Inference (Advanced)` 工作流升级时，请用当前推理节点替换旧高级节点，并把原来的高级参数填入 Parameters 节点。
 
@@ -33,12 +33,13 @@ ComfyUI 的 `IMAGE` 是 `[B,H,W,C]`；当 `B>1` 时，节点把整批图片按�
 | `frequency_penalty`、`presence_penalty` | 按出现次数或是否出现抑制重复内容。 |
 | `mirostat_mode`、`mirostat_tau`、`mirostat_eta` | 自适应采样器：0 关闭，1/2 分别为两个版本；关闭时后两项不起作用。 |
 | `enable_thinking`、`reasoning_budget` | 启用 Qwen 3.5 的思考模板，并可限制首个思考块的 token 数；`-1` 不限制。当前实现通过视觉处理器设置模板，因此开启思考时需要选择匹配的 `mmproj`。 |
-| `max_images` | 0 表示传入整个 `IMAGE` 批次；大于 0 时从批次中等间隔选取最多该数量的图片。 |
+| `inference_mode` | `all at once` 把选出的帧/图片放进一次请求；`one by one` 先逐帧分析，再用一次文本请求汇总；`auto` 在帧数不超过 8 且估计图像 token 不超过上下文 60% 时选整批，否则选逐帧。估计值不能保证一定适合当前模型，可手动切换。 |
+| `max_frames`、`max_size` | 分别限制均匀选取的帧/图片数和图像最长边；默认 24 帧、256 像素。`max_size=0` 保留原尺寸。OCR 或小字识别可提高尺寸和上下文。 |
 | `image_max_tokens` | 视觉处理器的单图 token 上限；`-1` 使用模型元数据默认值。 |
 | `n_batch`、`n_threads` | 逻辑批次和 CPU 线程数；线程数 0 使用后端默认值。物理微批次自动取 `min(512, n_batch)`。 |
 | `mtp_draft_tokens`、`mtp_draft_p_min` | 0 关闭 MTP；大于 0 时启用内置 MTP 推测解码，分别设置最大草稿长度和草稿概率下限。只有包含 MTP 层的兼容 GGUF 才能使用。 |
 
-MTP 是一种加速选项，不保证每个模型或硬件都更快；原理和 `draft-mtp` 模式见 [llama.cpp 推测解码文档](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)。修改加载类选项（上下文、批次、线程、视觉 token 限制、思考模式或 MTP）会重新加载模型；采样类选项不会。`num_beams` 和 `use_torch_compile` 属于截图中 Transformers 节点的设置，这个 GGUF 后端不使用。当前也没有原生 `VIDEO` 输入；视频节点输出的帧批次可接到 `IMAGE`，用 `max_images` 限制帧数。MTP 与图像输入组合的实际支持取决于所安装的 llama-cpp-python 构建。
+MTP 是一种加速选项，不保证每个模型或硬件都更快；原理和 `draft-mtp` 模式见 [llama.cpp 推测解码文档](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)。修改加载类选项（上下文、批次、线程、视觉 token 限制、思考模式或 MTP）会重新加载模型；采样类选项不会。`num_beams` 和 `use_torch_compile` 属于 Transformers 节点的设置，这个 GGUF 后端不使用。MTP 与图像输入组合的实际支持取决于所安装的 llama-cpp-python 构建。
 
 首次运行会加载模型，默认在后续运行复用同一模型；更换模型、mmproj 或加载类参数会重新加载。ComfyUI 退出时会释放模型。
 
