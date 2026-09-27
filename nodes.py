@@ -49,6 +49,7 @@ PARAMETER_DEFAULTS = {
     "mirostat_mode": 0, "mirostat_eta": 0.10, "mirostat_tau": 5.0,
     "enable_thinking": False, "reasoning_budget": -1,
     "inference_mode": "auto", "max_frames": 24, "max_size": 256,
+    "video_fps": 0.0,
     "image_max_tokens": -1,
     "n_batch": 512, "n_threads": 0,
     "mtp_draft_tokens": 0, "mtp_draft_p_min": 0.0,
@@ -188,7 +189,7 @@ def _image_data_url(frame, max_size=0):
 
 def _select_frames(image, max_frames):
     if image.ndim != 4 or image.shape[0] == 0:
-        raise ValueError("IMAGE or VIDEO frames must be a non-empty [batch, height, width, channels] tensor.")
+        raise ValueError("IMAGE input must be a non-empty [batch, height, width, channels] tensor.")
     total = image.shape[0]
     count = min(total, max_frames)
     indices = ([0] if count == 1 else
@@ -268,6 +269,7 @@ class QwenGGUFParameters:
             "inference_mode": (["auto", "one by one", "images", "video"],),
             "max_frames": ("INT", {"default": 24, "min": 1, "max": 1024}),
             "max_size": ("INT", {"default": 256, "min": 0, "max": 4096}),
+            "video_fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 240.0, "step": 0.1}),
             "max_tokens": ("INT", {"default": 1024, "min": 1, "max": 32768}),
             "top_k": ("INT", {"default": 30, "min": 0, "max": 1000}),
             "top_p": ("FLOAT", {"default": 0.90, "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -317,7 +319,7 @@ class QwenGGUFInference:
             },
             "optional": {
                 "image": ("IMAGE",),
-                "video": ("VIDEO",),
+                "video": ("IMAGE",),
                 "parameters": ("QWEN_GGUF_PARAMETERS",),
             },
         }
@@ -339,26 +341,18 @@ class QwenGGUFInference:
                 raise ValueError(f"Unknown inference parameters: {sorted(unknown)}")
             params.update(parameters)
         if image is not None and video is not None:
-            raise ValueError("Connect either IMAGE or VIDEO, not both.")
-        if params["max_frames"] < 1 or params["max_size"] < 0:
-            raise ValueError("max_frames must be positive and max_size cannot be negative.")
-        frame_rate = None
-        media = image
-        if video is not None:
-            if not callable(getattr(video, "get_components", None)):
-                raise TypeError("VIDEO input must be a ComfyUI VideoInput with get_components().")
-            components = video.get_components()
-            media = components.images
-            frame_rate = float(components.frame_rate)
-            if frame_rate <= 0:
-                raise ValueError("VIDEO frame rate must be positive.")
+            raise ValueError("Connect either image or video IMAGE input, not both.")
+        if params["max_frames"] < 1 or params["max_size"] < 0 or params["video_fps"] < 0:
+            raise ValueError("max_frames must be positive; max_size and video_fps cannot be negative.")
+        media = video if video is not None else image
+        frame_rate = float(params["video_fps"]) if video is not None and params["video_fps"] else None
         selected = _select_frames(media, params["max_frames"]) if media is not None else None
         selected_count = len(selected) if selected is not None else 0
         mode = _mode(selected_count, params, context_size, video is not None)
         model_path = _model_path(model)
         mmproj_path = None if mmproj == "None" else _model_path(mmproj)
         if media is not None and mmproj_path is None:
-            raise ValueError("IMAGE or VIDEO input requires the matching mmproj GGUF file.")
+            raise ValueError("IMAGE input requires the matching mmproj GGUF file.")
         if params["enable_thinking"] and mmproj_path is None:
             raise ValueError("enable_thinking requires mmproj: the Qwen35ChatHandler controls this template option.")
         if params["mtp_draft_tokens"] >= params["n_batch"]:
@@ -392,11 +386,13 @@ class QwenGGUFInference:
                     observations = []
                     for index, frame in selected:
                         label = (f"Frame {index + 1} ({index / frame_rate:.2f}s)"
-                                 if frame_rate is not None else f"Image {index + 1}")
+                                 if frame_rate is not None else
+                                 f"Frame {index + 1}" if video is not None else f"Image {index + 1}")
                         frame_prompt = (f"{prompt}\n\nDescribe only {label}. Keep the visible observations "
                                         "concise; do not infer events outside this frame.")
                         frame_messages = _messages(system_prompt, frame_prompt, [(index, frame)],
-                                                   params["max_size"], frame_rate)
+                                                   params["max_size"], frame_rate,
+                                                   as_video=video is not None)
                         frame_result = llm.create_chat_completion(
                             messages=frame_messages, max_tokens=min(params["max_tokens"], 256),
                             **completion_options,

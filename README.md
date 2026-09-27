@@ -12,9 +12,9 @@
 
 ## 节点用法
 
-添加 **Qwen 3.5+ GGUF Inference**。它接受可选的 `IMAGE` 批次或原生 `VIDEO` 输入、提示词预设、用户提示词和系统提示词。`IMAGE` 与 `VIDEO` 两者只能连接一个。输出为 `response`、`reasoning` 和 `stats_json`。预设指令会放在用户提示词之前；选 `Empty - Nothing` 时只使用用户提示词。`stats_json` 包含 token 用量、实际推理模式、取样帧数、模型调用次数，以及启用 MTP 时可用的推测解码统计。
+添加 **Qwen 3.5+ GGUF Inference**。`image` 和 `video` 两个可选输入现在都接受 ComfyUI 的 `IMAGE` 类型，但只能连接其中一个。普通图片或图片批次接 `image`；视频节点输出的有序帧批次接 `video`。其他输入包括提示词预设、用户提示词和系统提示词。输出为 `response`、`reasoning` 和 `stats_json`。预设指令会放在用户提示词之前；选 `Empty - Nothing` 时只使用用户提示词。`stats_json` 包含 token 用量、实际推理模式、取样帧数、模型调用次数，以及启用 MTP 时可用的推测解码统计。
 
-ComfyUI 的 `IMAGE` 是 `[B,H,W,C]`，图片批次保留顺序。原生 `VIDEO` 输入会读取视频帧和帧率，均匀选取最多 `max_frames` 帧；例如 240 帧的视频且 `max_frames=24` 时，会从全片抽取 24 帧，而不是只取开头 24 帧。未抽中的帧不参与推理，`stats_json` 会给出 `total_frames` 和 `selected_frames`。需要更密集的观察时可提高上限，或先将视频分段推理。帧会先按 `max_size` 限制最长边，再编码为 PNG。音轨不参与推理；这套 Qwen3.5 处理器目前不接受原生视频媒体消息，因此这里使用带时间戳的帧图像。ComfyUI 的 `get_components()` 会先解码整个视频，处理长视频前建议先用 **Trim Video** 缩短片段。
+ComfyUI 的 `IMAGE` 是 `[B,H,W,C]`，图片批次保留顺序。`video` 输入把批次视为按时间排列的视频帧，均匀选取最多 `max_frames` 帧；例如 240 帧且 `max_frames=24` 时，会从全片抽取 24 帧，而不是只取开头 24 帧。未抽中的帧不参与推理，`stats_json` 会给出 `total_frames` 和 `selected_frames`。`IMAGE` 批次不包含帧率；如需时间戳，可在 Parameters 节点填写 `video_fps`，默认 0 时只标注帧序号。需要更密集的观察时可提高上限，或先将视频分段推理。帧会先按 `max_size` 限制最长边，再编码为 PNG。音轨不参与推理；这套 Qwen3.5 处理器目前不接受原生视频媒体消息，因此这里使用有序帧图像。旧工作流若连接了原生 `VIDEO`，需改接视频解码节点输出的 `IMAGE` 帧批次。
 
 推理节点保留 `seed`、`attention_mode`、`context_size`、`gpu_layers` 和 `keep_model_loaded`。`seed` 支持 ComfyUI 的“生成后控制”选项。`attention_mode` 控制 llama.cpp 的 Flash Attention，仅有 `auto`、`on`、`off`；它不对应 PyTorch 的 SageAttention、FlashAttention 2 或 SDPA。关闭 `keep_model_loaded` 会在本次推理结束后释放模型。量化等级由选择的 GGUF 文件决定，因此没有单独的量化控件。
 
@@ -35,6 +35,7 @@ ComfyUI 的 `IMAGE` 是 `[B,H,W,C]`，图片批次保留顺序。原生 `VIDEO` 
 | `enable_thinking`、`reasoning_budget` | 启用 Qwen 3.5 的思考模板，并可限制首个思考块的 token 数；`-1` 不限制。当前实现通过视觉处理器设置模板，因此开启思考时需要选择匹配的 `mmproj`。 |
 | `inference_mode` | `images` 把选出的图片放进一次请求；`video` 把选出的帧作为按时间排序的视频序列放进一次请求，并附加视频分析指令；`one by one` 先逐帧分析，再用一次文本请求汇总。`auto` 在帧数不超过 8 且估计图像 token 不超过上下文 60% 时，按输入类型选 `images` 或 `video`，否则选 `one by one`。估计值不能保证一定适合当前模型，可手动切换。`video` 也使用图像帧，不发送原生视频媒体消息。 |
 | `max_frames`、`max_size` | 分别限制均匀选取的帧/图片数和图像最长边；默认 24 帧、256 像素。超出上限的输入会均匀抽样，适用于所有推理模式。`max_size=0` 保留原尺寸。OCR 或小字识别可提高尺寸和上下文。 |
+| `video_fps` | `video` 输入的帧率；默认 0 表示未知，只显示帧序号。设置实际帧率后，提示词中会增加相对时间戳。 |
 | `image_max_tokens` | 视觉处理器的单图 token 上限；`-1` 使用模型元数据默认值。 |
 | `n_batch`、`n_threads` | 逻辑批次和 CPU 线程数；线程数 0 使用后端默认值。物理微批次自动取 `min(512, n_batch)`。 |
 | `mtp_draft_tokens`、`mtp_draft_p_min` | 0 关闭 MTP；大于 0 时启用内置 MTP 推测解码，分别设置最大草稿长度和草稿概率下限。只有包含 MTP 层的兼容 GGUF 才能使用。 |
