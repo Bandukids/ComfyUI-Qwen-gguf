@@ -21,14 +21,36 @@ _MODEL = None
 _CONFIG = None
 
 PROMPT_PRESETS = {
-    "None": "",
-    "Detailed Description": "Describe the image in detail, including its subjects, setting, actions, and visible text.",
-    "Brief Description": "Describe the image briefly and accurately.",
+    "Empty - Nothing": "",
+    "Normal - Describe": "Describe the supplied image or images accurately.",
+    "Prompt Style - Tags": "Describe the visual content as concise, comma-separated tags.",
+    "Prompt Style - Simple": "Write a short, clear image-generation prompt based on the visual content.",
+    "Prompt Style - Detailed": "Write a detailed image-generation prompt covering subject, setting, composition, lighting, and style.",
+    "Prompt Style - Extreme Detailed": "Write a very detailed image-generation prompt covering subjects, textures, composition, lighting, colors, and atmosphere.",
+    "Prompt Style - Cinematic": "Write a cinematic image-generation prompt describing framing, lens perspective, lighting, mood, and scene details.",
+    "Creative - Detailed Analysis": "Analyze the visual content in detail, separating direct observations from interpretation.",
+    "Creative - Summarize Video": "Treat the ordered images as video frames and summarize the visible sequence of events. Do not invent unseen events.",
+    "Creative - Short Story": "Write a short story inspired by the visual content; clearly treat creative details as fiction.",
+    "Creative - Refine & Expand Prompt": "Refine and expand the user's prompt using details visible in the image. Preserve the user's intent.",
+    "Vision - *Bounding Box": "Identify prominent objects and give approximate bounding boxes as normalized [x1,y1,x2,y2] coordinates from 0 to 1.",
     "Extract Text (OCR)": "Transcribe all readable text in the image. Preserve its original language and line breaks.",
     "Compare Images": "Compare the images in order. Explain their important similarities and differences.",
 }
 
-ATTENTION_MODES = {"auto": -1, "disabled": 0, "enabled": 1}
+# llama.cpp offers Flash Attention auto/on/off, not Torch SDPA/SageAttention/FA2.
+ATTENTION_MODES = {"auto": -1, "on": 1, "off": 0, "enabled": 1, "disabled": 0}
+ATTENTION_CHOICES = ("auto", "on", "off")
+
+PARAMETER_DEFAULTS = {
+    "max_tokens": 1024, "top_k": 30, "top_p": 0.90, "min_p": 0.05,
+    "typical_p": 1.0, "temperature": 0.80, "repeat_penalty": 1.0,
+    "frequency_penalty": 0.0, "presence_penalty": 0.0,
+    "mirostat_mode": 0, "mirostat_eta": 0.10, "mirostat_tau": 5.0,
+    "enable_thinking": False, "reasoning_budget": -1,
+    "max_images": 0, "image_max_tokens": -1,
+    "n_batch": 512, "n_threads": 0,
+    "mtp_draft_tokens": 0, "mtp_draft_p_min": 0.0,
+}
 
 
 def _gguf_files():
@@ -174,6 +196,43 @@ def _prompt_with_preset(preset_prompt, user_prompt):
     return "\n\n".join(part for part in (preset, user_prompt.strip()) if part)
 
 
+class QwenGGUFParameters:
+    """A reusable parameter bundle for the inference node."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "max_tokens": ("INT", {"default": 1024, "min": 1, "max": 32768}),
+            "top_k": ("INT", {"default": 30, "min": 0, "max": 1000}),
+            "top_p": ("FLOAT", {"default": 0.90, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "typical_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "temperature": ("FLOAT", {"default": 0.80, "min": 0.0, "max": 2.0, "step": 0.05}),
+            "repeat_penalty": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.01}),
+            "frequency_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05}),
+            "presence_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05}),
+            "mirostat_mode": ("INT", {"default": 0, "min": 0, "max": 2}),
+            "mirostat_eta": ("FLOAT", {"default": 0.10, "min": 0.001, "max": 1.0, "step": 0.01}),
+            "mirostat_tau": ("FLOAT", {"default": 5.0, "min": 0.1, "max": 20.0, "step": 0.1}),
+            "enable_thinking": ("BOOLEAN", {"default": False}),
+            "reasoning_budget": ("INT", {"default": -1, "min": -1, "max": 32768}),
+            "max_images": ("INT", {"default": 0, "min": 0, "max": 1024}),
+            "image_max_tokens": ("INT", {"default": -1, "min": -1, "max": 16384}),
+            "n_batch": ("INT", {"default": 512, "min": 32, "max": 8192}),
+            "n_threads": ("INT", {"default": 0, "min": 0, "max": 128}),
+            "mtp_draft_tokens": ("INT", {"default": 0, "min": 0, "max": 32}),
+            "mtp_draft_p_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+        }}
+
+    RETURN_TYPES = ("QWEN_GGUF_PARAMETERS",)
+    RETURN_NAMES = ("parameters",)
+    FUNCTION = "build"
+    CATEGORY = "Qwen/GGUF"
+
+    def build(self, **options):
+        return (dict(options),)
+
+
 class QwenGGUFInference:
     @classmethod
     def INPUT_TYPES(cls):
@@ -184,130 +243,73 @@ class QwenGGUFInference:
             "required": {
                 "model": (models or ["No GGUF model found"],),
                 "mmproj": (["None"] + projectors,),
-                "system_prompt": ("STRING", {"multiline": True, "default": "You are a helpful assistant."}),
-                "preset_prompt": (list(PROMPT_PRESETS),),
+                "preset_prompt": (list(PROMPT_PRESETS), {"default": "Normal - Describe"}),
                 "user_prompt": ("STRING", {"multiline": True, "default": "Describe this image."}),
-                "max_tokens": ("INT", {"default": 512, "min": 1, "max": 32768}),
-                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "attention_mode": (list(ATTENTION_MODES),),
+                "system_prompt": ("STRING", {"multiline": True, "default": "You are a helpful assistant."}),
+                "attention_mode": (list(ATTENTION_CHOICES),),
                 "context_size": ("INT", {"default": 8192, "min": 512, "max": 262144}),
                 "gpu_layers": ("INT", {"default": 99, "min": 0, "max": 999}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffff, "control_after_generate": True}),
             },
-            "optional": {"image": ("IMAGE",)},
+            "optional": {"image": ("IMAGE",), "parameters": ("QWEN_GGUF_PARAMETERS",)},
         }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("response",)
-    FUNCTION = "infer"
-    CATEGORY = "Qwen/GGUF"
-
-    def infer(self, model, mmproj, system_prompt, user_prompt, max_tokens, temperature,
-              context_size, gpu_layers, image=None, preset_prompt="None",
-              attention_mode="auto", keep_model_loaded=True, seed=0):
-        model_path = _model_path(model)
-        mmproj_path = None if mmproj == "None" else _model_path(mmproj)
-        if image is not None and mmproj_path is None:
-            raise ValueError("Image input requires the matching mmproj GGUF file.")
-        messages = _messages(system_prompt, _prompt_with_preset(preset_prompt, user_prompt), image)
-        with _LOCK:
-            try:
-                llm = _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_mode)
-                result = llm.create_chat_completion(
-                    messages=messages, max_tokens=max_tokens, temperature=temperature, seed=seed,
-                )
-            finally:
-                if not keep_model_loaded:
-                    _close_model()
-        try:
-            message = result["choices"][0]["message"]
-            answer = message.get("content") or message.get("reasoning_content")
-            if isinstance(answer, list):
-                answer = "".join(part.get("text", "") for part in answer if isinstance(part, dict))
-            if not isinstance(answer, str):
-                raise ValueError("non-text response")
-            return (answer,)
-        except (KeyError, IndexError, TypeError, ValueError) as error:
-            raise RuntimeError(f"Unexpected llama-cpp-python response: {str(result)[:1000]}") from error
-
-
-class QwenGGUFInferenceAdvanced(QwenGGUFInference):
-    """Expose GGUF load options, samplers, thinking, and built-in MTP."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        inputs = super().INPUT_TYPES()
-        inputs["required"].update({
-            "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01}),
-            "top_k": ("INT", {"default": 40, "min": 0, "max": 1000}),
-            "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
-            "repetition_penalty": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.01}),
-            "penalty_last_n": ("INT", {"default": 64, "min": -1, "max": 8192}),
-            "frequency_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05}),
-            "presence_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05}),
-            "mirostat_mode": (["off", "v1", "v2"],),
-            "mirostat_tau": ("FLOAT", {"default": 5.0, "min": 0.1, "max": 20.0, "step": 0.1}),
-            "mirostat_eta": ("FLOAT", {"default": 0.1, "min": 0.001, "max": 1.0, "step": 0.01}),
-            "enable_thinking": ("BOOLEAN", {"default": False}),
-            "reasoning_budget": ("INT", {"default": -1, "min": -1, "max": 32768}),
-            "max_images": ("INT", {"default": 0, "min": 0, "max": 1024}),
-            "image_max_tokens": ("INT", {"default": -1, "min": -1, "max": 16384}),
-            "n_batch": ("INT", {"default": 512, "min": 32, "max": 8192}),
-            "n_ubatch": ("INT", {"default": 512, "min": 32, "max": 8192}),
-            "n_threads": ("INT", {"default": 0, "min": 0, "max": 128}),
-            "mtp_draft_tokens": ("INT", {"default": 0, "min": 0, "max": 32}),
-            "mtp_draft_p_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-        })
-        return inputs
 
     RETURN_TYPES = ("STRING", "STRING", "STRING")
     RETURN_NAMES = ("response", "reasoning", "stats_json")
     FUNCTION = "infer"
+    CATEGORY = "Qwen/GGUF"
 
-    def infer(self, **options):
-        model_path = _model_path(options["model"])
-        mmproj_path = None if options["mmproj"] == "None" else _model_path(options["mmproj"])
-        image = options.get("image")
+    def infer(self, model, mmproj, user_prompt, system_prompt, preset_prompt="Normal - Describe",
+              attention_mode="auto", context_size=8192, gpu_layers=99,
+              keep_model_loaded=True, seed=0, image=None, parameters=None):
+        if parameters is not None and not isinstance(parameters, dict):
+            raise TypeError("parameters must come from a Qwen GGUF Parameters node.")
+        params = dict(PARAMETER_DEFAULTS)
+        if parameters:
+            unknown = set(parameters) - set(params)
+            if unknown:
+                raise ValueError(f"Unknown inference parameters: {sorted(unknown)}")
+            params.update(parameters)
+        model_path = _model_path(model)
+        mmproj_path = None if mmproj == "None" else _model_path(mmproj)
         if image is not None and mmproj_path is None:
             raise ValueError("Image input requires the matching mmproj GGUF file.")
-        if options["enable_thinking"] and mmproj_path is None:
+        if params["enable_thinking"] and mmproj_path is None:
             raise ValueError("enable_thinking requires mmproj: the Qwen35ChatHandler controls this template option.")
-        if options["mtp_draft_tokens"] and options["mtp_draft_tokens"] >= options["n_batch"]:
+        if params["mtp_draft_tokens"] >= params["n_batch"]:
             raise ValueError("mtp_draft_tokens must be smaller than n_batch.")
 
         messages = _messages(
-            options["system_prompt"],
-            _prompt_with_preset(options["preset_prompt"], options["user_prompt"]),
-            image, options["max_images"],
+            system_prompt, _prompt_with_preset(preset_prompt, user_prompt),
+            image, params["max_images"],
         )
         with _LOCK:
             try:
                 llm = _ensure_model(
-                    model_path, mmproj_path, options["context_size"], options["gpu_layers"],
-                    options["attention_mode"], n_batch=options["n_batch"],
-                    n_ubatch=options["n_ubatch"], n_threads=options["n_threads"],
-                    image_max_tokens=options["image_max_tokens"],
-                    enable_thinking=options["enable_thinking"],
-                    mtp_draft_tokens=options["mtp_draft_tokens"],
-                    mtp_draft_p_min=options["mtp_draft_p_min"],
+                    model_path, mmproj_path, context_size, gpu_layers, attention_mode,
+                    n_batch=params["n_batch"], n_ubatch=min(512, params["n_batch"]),
+                    n_threads=params["n_threads"], image_max_tokens=params["image_max_tokens"],
+                    enable_thinking=params["enable_thinking"],
+                    mtp_draft_tokens=params["mtp_draft_tokens"],
+                    mtp_draft_p_min=params["mtp_draft_p_min"],
                 )
                 result = llm.create_chat_completion(
-                    messages=messages, max_tokens=options["max_tokens"],
-                    temperature=options["temperature"], top_p=options["top_p"],
-                    top_k=options["top_k"], min_p=options["min_p"],
-                    repeat_penalty=options["repetition_penalty"],
-                    penalty_last_n=options["penalty_last_n"],
-                    frequency_penalty=options["frequency_penalty"],
-                    presence_penalty=options["presence_penalty"],
-                    mirostat_mode={"off": 0, "v1": 1, "v2": 2}[options["mirostat_mode"]],
-                    mirostat_tau=options["mirostat_tau"], mirostat_eta=options["mirostat_eta"],
-                    reasoning_budget=options["reasoning_budget"] if options["enable_thinking"] else -1,
-                    seed=options["seed"],
+                    messages=messages, max_tokens=params["max_tokens"],
+                    temperature=params["temperature"], top_p=params["top_p"],
+                    top_k=params["top_k"], min_p=params["min_p"],
+                    typical_p=params["typical_p"],
+                    repeat_penalty=params["repeat_penalty"],
+                    frequency_penalty=params["frequency_penalty"],
+                    presence_penalty=params["presence_penalty"],
+                    mirostat_mode=params["mirostat_mode"],
+                    mirostat_tau=params["mirostat_tau"], mirostat_eta=params["mirostat_eta"],
+                    reasoning_budget=params["reasoning_budget"] if params["enable_thinking"] else -1,
+                    seed=seed,
                 )
-                spec_stats = getattr(llm, "last_speculative_stats", {}) if options["mtp_draft_tokens"] else {}
+                spec_stats = getattr(llm, "last_speculative_stats", {}) if params["mtp_draft_tokens"] else {}
             finally:
-                if not options["keep_model_loaded"]:
+                if not keep_model_loaded:
                     _close_model()
 
         try:

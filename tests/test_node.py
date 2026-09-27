@@ -49,6 +49,8 @@ class FakeTensor:
 
 class FakeLlama:
     instances = []
+    response = {"choices": [{"message": {"content": "two images"}}],
+                "usage": {"completion_tokens": 3}}
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -59,8 +61,7 @@ class FakeLlama:
     def create_chat_completion(self, **kwargs):
         self.completion_kwargs = kwargs
         self.messages = kwargs["messages"]
-        return {"choices": [{"message": {"content": "two images"}}],
-                "usage": {"completion_tokens": 3}}
+        return self.response
 
     def close(self):
         self.closed = True
@@ -131,24 +132,36 @@ class QwenNodeTests(unittest.TestCase):
         self.nodes._close_model()
         FakeLlama.instances.clear()
         FakeHandler.instances.clear()
+        FakeLlama.response = {"choices": [{"message": {"content": "two images"}}],
+                              "usage": {"completion_tokens": 3}}
 
-    def test_existing_qwenvl_model_is_listed(self):
+    def test_inputs_and_preset_order(self):
         options = self.nodes.QwenGGUFInference.INPUT_TYPES()["required"]
         self.assertIn(str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), options["model"][0])
         self.assertIn(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"), options["mmproj"][0])
+        self.assertLess(list(options).index("user_prompt"), list(options).index("system_prompt"))
+        self.assertEqual(options["attention_mode"][0], ["auto", "on", "off"])
+        self.assertIn("Prompt Style - Cinematic", options["preset_prompt"][0])
+        self.assertIn("parameters", self.nodes.QwenGGUFInference.INPUT_TYPES()["optional"])
         self.assertTrue(options["seed"][1]["control_after_generate"])
+
+    def base_options(self, mmproj="None"):
+        return dict(model=str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), mmproj=mmproj,
+                    user_prompt="describe", system_prompt="system")
+
+    def parameter_options(self):
+        required = self.nodes.QwenGGUFParameters.INPUT_TYPES()["required"]
+        return {name: spec[1]["default"] for name, spec in required.items()}
 
     def test_batch_is_one_ordered_multimodal_request(self):
         pixels = np.zeros((2, 2, 2, 3), dtype=np.float32)
         pixels[0, :, :, 0] = 1
         pixels[1, :, :, 1] = 1
-        result = self.nodes.QwenGGUFInference().infer(
-            str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"),
-            str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"),
-            "system", "compare", 128, 0.5, 8192, 99, FakeTensor(pixels),
-        )
+        options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
+        options.update(preset_prompt="Compare Images", image=FakeTensor(pixels))
+        result = self.nodes.QwenGGUFInference().infer(**options)
 
-        self.assertEqual(result, ("two images",))
+        self.assertEqual(result[:2], ("two images", ""))
         self.assertEqual(len(FakeLlama.instances), 1)
         self.assertEqual(FakeLlama.instances[0].kwargs["n_gpu_layers"], 0)
         self.assertEqual(FakeLlama.instances[0].kwargs["flash_attn_type"], -1)
@@ -160,6 +173,7 @@ class QwenNodeTests(unittest.TestCase):
                          ["text", "text", "image_url", "text", "image_url"])
         self.assertEqual(content[1]["text"], "Image 1:")
         self.assertEqual(content[3]["text"], "Image 2:")
+        self.assertIn("Compare the images", content[0]["text"])
         for part, channel in ((content[2], 0), (content[4], 1)):
             url = part["image_url"]["url"]
             self.assertTrue(url.startswith("data:image/png;base64,"))
@@ -169,25 +183,25 @@ class QwenNodeTests(unittest.TestCase):
     def test_model_is_reused(self):
         node = self.nodes.QwenGGUFInference()
         for _ in range(2):
-            node.infer(str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), "None", "", "hello",
-                       10, 0, 8192, 0)
+            node.infer(**self.base_options())
         self.assertEqual(len(FakeLlama.instances), 1)
 
     def test_preset_and_seed_are_forwarded(self):
-        node = self.nodes.QwenGGUFInference()
-        node.infer(str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), "None", "", "Focus on the sign.",
-                   10, 0, 8192, 0, preset_prompt="Extract Text (OCR)", seed=12345)
+        options = self.base_options()
+        options.update(user_prompt="Focus on the sign.", preset_prompt="Extract Text (OCR)", seed=12345)
+        self.nodes.QwenGGUFInference().infer(**options)
         request = FakeLlama.instances[0].completion_kwargs
         self.assertEqual(request["seed"], 12345)
-        self.assertIn("Transcribe all readable text", request["messages"][0]["content"])
-        self.assertIn("Focus on the sign.", request["messages"][0]["content"])
+        self.assertEqual(request["max_tokens"], 1024)
+        self.assertIn("Transcribe all readable text", request["messages"][1]["content"])
+        self.assertIn("Focus on the sign.", request["messages"][1]["content"])
 
     def test_attention_change_reloads_and_keep_off_releases(self):
         node = self.nodes.QwenGGUFInference()
-        args = (str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), "None", "", "hello", 10, 0, 8192, 0)
-        node.infer(*args)
+        options = self.base_options()
+        node.infer(**options)
         first = FakeLlama.instances[0]
-        node.infer(*args, attention_mode="disabled", keep_model_loaded=False)
+        node.infer(**options, attention_mode="off", keep_model_loaded=False)
         self.assertTrue(first.closed)
         self.assertEqual(FakeLlama.instances[1].kwargs["flash_attn_type"], 0)
         self.assertTrue(FakeLlama.instances[1].closed)
@@ -196,41 +210,34 @@ class QwenNodeTests(unittest.TestCase):
     def test_image_requires_projector(self):
         image = FakeTensor(np.zeros((1, 1, 1, 3), dtype=np.float32))
         with self.assertRaisesRegex(ValueError, "mmproj"):
-            self.nodes.QwenGGUFInference().infer(
-                str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), "None", "", "hello",
-                10, 0, 8192, 0, image,
-            )
+            self.nodes.QwenGGUFInference().infer(**self.base_options(), image=image)
 
     def test_invalid_path_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Invalid GGUF"):
             self.nodes._model_path("../outside.gguf")
 
-    def advanced_options(self, mmproj="None"):
-        required = self.nodes.QwenGGUFInferenceAdvanced.INPUT_TYPES()["required"]
-        options = {name: spec[1].get("default") if len(spec) > 1 and isinstance(spec[1], dict) else spec[0][0]
-                   for name, spec in required.items()}
-        options.update(model=str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"),
-                       mmproj=mmproj, user_prompt="describe")
-        return options
-
-    def test_advanced_sampler_and_batch_limits(self):
-        options = self.advanced_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
-        options.update(top_p=0.8, top_k=30, min_p=0.1, repetition_penalty=1.2,
-                       frequency_penalty=0.4, presence_penalty=0.3,
-                       mirostat_mode="v2", n_batch=1024, n_ubatch=256,
-                       n_threads=4, image_max_tokens=600, max_images=2,
-                       enable_thinking=True, reasoning_budget=80,
+    def test_connected_parameters_are_forwarded(self):
+        params = self.parameter_options()
+        params.update(top_p=0.8, top_k=50, min_p=0.1, typical_p=0.7,
+                      repeat_penalty=1.2, frequency_penalty=0.4,
+                      presence_penalty=0.3, mirostat_mode=2, n_batch=1024,
+                      n_threads=4, image_max_tokens=600, max_images=2,
+                      enable_thinking=True, reasoning_budget=80)
+        bundle = self.nodes.QwenGGUFParameters().build(**params)[0]
+        options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
+        options.update(parameters=bundle,
                        image=FakeTensor(np.zeros((4, 2, 2, 3), dtype=np.float32)))
-        answer, reasoning, stats = self.nodes.QwenGGUFInferenceAdvanced().infer(**options)
+        answer, reasoning, stats = self.nodes.QwenGGUFInference().infer(**options)
         self.assertEqual((answer, reasoning), ("two images", ""))
         self.assertIn('"completion_tokens": 3', stats)
         instance = FakeLlama.instances[0]
-        self.assertEqual(instance.kwargs["n_ubatch"], 256)
+        self.assertEqual(instance.kwargs["n_batch"], 1024)
         self.assertEqual(instance.kwargs["n_threads"], 4)
         self.assertEqual(FakeHandler.instances[0].kwargs["image_max_tokens"], 600)
         self.assertTrue(FakeHandler.instances[0].kwargs["enable_thinking"])
         request = instance.completion_kwargs
-        for name, value in (("top_p", 0.8), ("top_k", 30), ("min_p", 0.1),
+        for name, value in (("top_p", 0.8), ("top_k", 50), ("min_p", 0.1),
+                            ("typical_p", 0.7),
                             ("repeat_penalty", 1.2), ("frequency_penalty", 0.4),
                             ("presence_penalty", 0.3), ("mirostat_mode", 2),
                             ("reasoning_budget", 80)):
@@ -239,21 +246,23 @@ class QwenNodeTests(unittest.TestCase):
                           if part["type"] == "text"][1:], ["Image 1:", "Image 4:"])
 
     def test_mtp_uses_speculative_config_and_reloads(self):
-        options = self.advanced_options()
-        node = self.nodes.QwenGGUFInferenceAdvanced()
+        options = self.base_options()
+        node = self.nodes.QwenGGUFInference()
         node.infer(**options)
         first = FakeLlama.instances[0]
-        options.update(mtp_draft_tokens=4, mtp_draft_p_min=0.15)
-        node.infer(**options)
+        params = self.parameter_options()
+        params.update(mtp_draft_tokens=4, mtp_draft_p_min=0.15)
+        node.infer(**options, parameters=self.nodes.QwenGGUFParameters().build(**params)[0])
         self.assertTrue(first.closed)
         spec = FakeLlama.instances[1].kwargs["speculative"]
         self.assertEqual((spec.spec_type, spec.draft_n_max, spec.draft_p_min), (3, 4, 0.15))
 
     def test_thinking_requires_projector(self):
-        options = self.advanced_options()
-        options["enable_thinking"] = True
+        options = self.base_options()
+        params = self.parameter_options()
+        params["enable_thinking"] = True
         with self.assertRaisesRegex(ValueError, "requires mmproj"):
-            self.nodes.QwenGGUFInferenceAdvanced().infer(**options)
+            self.nodes.QwenGGUFInference().infer(**options, parameters=params)
 
 
 if __name__ == "__main__":

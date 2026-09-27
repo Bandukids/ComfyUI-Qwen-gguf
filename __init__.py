@@ -1,13 +1,13 @@
-from .nodes import QwenGGUFInference, QwenGGUFInferenceAdvanced
+from .nodes import QwenGGUFInference, QwenGGUFParameters
 
 
 NODE_CLASS_MAPPINGS = {
     "QwenGGUFInference": QwenGGUFInference,
-    "QwenGGUFInferenceAdvanced": QwenGGUFInferenceAdvanced,
+    "QwenGGUFParameters": QwenGGUFParameters,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "QwenGGUFInference": "Qwen 3.5+ GGUF Inference",
-    "QwenGGUFInferenceAdvanced": "Qwen 3.5+ GGUF Inference (Advanced)",
+    "QwenGGUFParameters": "Qwen GGUF Parameters",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
