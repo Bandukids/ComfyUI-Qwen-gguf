@@ -1,47 +1,123 @@
-# ComfyUI Qwen 3.5+ GGUF
+# ComfyUI Qwen GGUF
 
-一个精简的 ComfyUI 扩展，用本地 GGUF 模型运行 Qwen 3.5 及后续版本的文本、图片批次或视频帧推理。一个推理节点可独立使用，也可连接一个参数节点调节高级设置；不下载模型，不安装 Transformers，也不支持早期 Qwen 模型。
+**在 ComfyUI 中用本地 Qwen 3.5+ GGUF 进行文本、图片批次与视频帧推理。** 只保留一个推理节点和一个可选的参数节点，无需 `llama-server`、Transformers 或在线 API。
 
-## 准备
+> Local Qwen GGUF vision inference for ComfyUI. Accepts images, ordered image batches, and native ComfyUI video. See the installation steps below.
 
-1. 将本目录放进 `ComfyUI/custom_nodes/`，重启 ComfyUI。
-2. 在 **ComfyUI 自己的 Python 环境**中安装带有 `Qwen35ChatHandler` 的 `llama-cpp-python`。推荐使用 [JamePeng/llama-cpp-python](https://github.com/JamePeng/llama-cpp-python)；可在 [Releases 页面](https://github.com/JamePeng/llama-cpp-python/releases)按操作系统、Python 版本和 GPU 后端选择预编译 wheel。该项目的 `0.3.49` 版本已验证提供所需接口。如果已安装近期版本的 `ComfyUI-QwenVL` 及其 GGUF 依赖，通常可以复用，不需要 `llama-server`。
-3. 将主模型 `.gguf` 和**匹配该模型的**视觉投影文件 `mmproj*.gguf` 放进 `ComfyUI/models/LLM/` 的任意子目录（例如 `LLM/Qwen-VL/` 或 `LLM/GGUF/`）。重启或刷新节点后选择两个文件。纯文本推理时 `mmproj` 可以选 `None`。
+## 功能一览
 
-节点还使用 ComfyUI 自带的 PyTorch 和 Pillow。安装 wheel 时请使用 ComfyUI 的 Python，而不是系统 Python。GPU 推理依赖带相应 GPU 后端的构建；节点会在检测前注册动态 ggml 后端。若当前构建仍不支持 GPU，节点会自动使用 CPU 并在控制台提示。`stats_json` 的 `gpu_layers_effective` 是传给后端的 GPU 层数参数；0 表示节点未请求模型层卸载到 GPU。
-
-## 节点用法
-
-添加 **Qwen 3.5+ GGUF Inference**。`image` 接受 ComfyUI 的 `IMAGE`：单张图片、图片批次或视频解码后的有序图片帧批次都能接。`video` 接受 ComfyUI 原生 `VIDEO`，可直接连接支持该类型的视频节点。两个输入只能连接其中一个。其他输入包括提示词预设、用户提示词和系统提示词。输出为 `response`、`reasoning` 和 `stats_json`。预设指令会放在用户提示词之前；选 `Empty - Nothing` 时只使用用户提示词。`stats_json` 包含 token 用量、实际推理模式、取样帧数、模型调用次数，以及启用 MTP 时可用的推测解码统计。
-
-ComfyUI 的 `IMAGE` 是 `[B,H,W,C]`，批次保留顺序。图片形式的视频接 `image` 后，可把 `inference_mode` 设为 `video`；若 `video_fps` 大于 0，`auto` 也会将其识别为视频序列并在提示中标注时间戳。`IMAGE` 本身不含帧率，`video_fps=0` 时只标注帧序号。原生 `VIDEO` 接 `video` 后自动读取帧率，忽略手动填写的 `video_fps`。两种输入都均匀选取最多 `max_frames` 帧；例如 240 帧且 `max_frames=24` 时，会从全片抽取 24 帧，而不是只取开头 24 帧。未抽中的帧不参与推理，`stats_json` 会给出 `total_frames` 和 `selected_frames`。需要更密集的观察时可提高上限，或先将视频分段推理。帧会先按 `max_size` 限制最长边，再编码为 PNG。音轨不参与推理；这套 Qwen3.5 处理器目前不接受原生视频媒体消息，因此两种输入最终都使用有序帧图像。
-
-推理节点保留 `seed`、`attention_mode`、`context_size`、`gpu_layers` 和 `keep_model_loaded`。`seed` 支持 ComfyUI 的“生成后控制”选项。`attention_mode` 控制 llama.cpp 的 Flash Attention，仅有 `auto`、`on`、`off`；它不对应 PyTorch 的 SageAttention、FlashAttention 2 或 SDPA。关闭 `keep_model_loaded` 会在本次推理结束后释放模型。量化等级由选择的 GGUF 文件决定，因此没有单独的量化控件。
-
-预设列表参考了 QwenVL 的描述、标签、简单/详细/电影化提示词，以及详细分析、视频帧总结、短故事、提示词扩写和目标框选项；另保留 OCR 与多图比较。自定义用户提示词可以进一步限定输出语言与格式。
-
-## Parameters 节点
-
-需要调参时，添加 **Qwen GGUF Parameters**，把其 `parameters` 输出连接到推理节点的可选 `parameters` 输入。不连接时使用内置默认值。一个参数节点也可以连接多个推理节点。`enable_thinking` 与 `reasoning_budget` 位于参数节点顶部。
-
-从旧版 `Qwen 3.5+ GGUF Inference (Advanced)` 工作流升级时，请用当前推理节点替换旧高级节点，并把原来的高级参数填入 Parameters 节点。
-
-| 参数 | 用途 |
+| 功能 | 说明 |
 | --- | --- |
-| `max_tokens`、`temperature`、`top_p`、`top_k`、`min_p`、`typical_p` | 控制输出长度和采样；`typical_p=1` 关闭典型采样限制。 |
-| `repeat_penalty` | 调整重复惩罚；1.0 表示不施加。 |
-| `frequency_penalty`、`presence_penalty` | 按出现次数或是否出现抑制重复内容。 |
-| `mirostat_mode`、`mirostat_tau`、`mirostat_eta` | 自适应采样器：0 关闭，1/2 分别为两个版本；关闭时后两项不起作用。 |
-| `enable_thinking`、`reasoning_budget` | 启用 Qwen 3.5 的思考模板，并可限制首个思考块的 token 数；`-1` 不限制。当前实现通过视觉处理器设置模板，因此开启思考时需要选择匹配的 `mmproj`。 |
-| `inference_mode` | `images` 把选出的图片放进一次请求；`video` 把选出的帧作为按时间排序的视频序列放进一次请求，并附加视频分析指令；`one by one` 先逐帧分析，再用一次文本请求汇总。`auto` 在帧数不超过 8 且估计图像 token 不超过上下文 60% 时，原生 `VIDEO` 或设置了 `video_fps` 的图片帧批次选 `video`，普通 `IMAGE` 批次选 `images`，否则选 `one by one`。无法仅凭 `IMAGE` 张量自动判断它是普通图片批次还是视频帧；帧率未知时请手动选 `video`。估计值不能保证一定适合当前模型，可手动切换。 |
-| `max_frames`、`max_size` | 分别限制均匀选取的帧/图片数和图像最长边；默认 24 帧、256 像素。超出上限的输入会均匀抽样，适用于所有推理模式。`max_size=0` 保留原尺寸。OCR 或小字识别可提高尺寸和上下文。 |
-| `video_fps` | 给 `image` 接口上的视频帧批次补充帧率；默认 0 表示未知。原生 `VIDEO` 使用其自带帧率。 |
-| `image_max_tokens` | 视觉处理器的单图 token 上限；`-1` 使用模型元数据默认值。 |
-| `n_batch`、`n_threads` | 逻辑批次和 CPU 线程数；线程数 0 使用后端默认值。物理微批次自动取 `min(512, n_batch)`。 |
-| `mtp_draft_tokens`、`mtp_draft_p_min` | 0 关闭 MTP；大于 0 时启用内置 MTP 推测解码，分别设置最大草稿长度和草稿概率下限。只有包含 MTP 层的兼容 GGUF 才能使用。 |
+| 模型 | 本地 GGUF 主模型；视觉输入需配套 `mmproj*.gguf` |
+| 输入 | 文本、单图、多图、图片形式的视频帧批次、原生 ComfyUI `VIDEO` |
+| 提示词 | 用户提示词、系统提示词，以及描述、OCR、视频总结等预设 |
+| 推理 | `auto`、`images`、`video`、`one by one` 四种模式 |
+| 调参 | 采样、思考预算、上下文、Flash Attention、GPU 层数、可选 MTP |
+| 输出 | `response`、`reasoning`、`stats_json` |
 
-MTP 是一种加速选项，不保证每个模型或硬件都更快；原理和 `draft-mtp` 模式见 [llama.cpp 推测解码文档](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)。修改加载类选项（上下文、批次、线程、视觉 token 限制、思考模式或 MTP）会重新加载模型；采样类选项不会。`num_beams` 和 `use_torch_compile` 属于 Transformers 节点的设置，这个 GGUF 后端不使用。MTP 与图像输入组合的实际支持取决于所安装的 llama-cpp-python 构建。
+本项目围绕可提供 `Qwen35ChatHandler` 的 GGUF 后端实现。后续 Qwen 模型是否兼容，取决于模型 GGUF、匹配的 mmproj 和所安装的 `llama-cpp-python` 构建；不支持早期 Qwen 模型。
 
-首次运行会加载模型，默认在后续运行复用同一模型；更换模型、mmproj 或加载类参数会重新加载。ComfyUI 退出时会释放模型。
+## 安装
 
-实现参考了 [ComfyUI-llama-cpp_vlm](https://github.com/lihaoyun6/ComfyUI-llama-cpp_vlm) 和 [ComfyUI-QwenVL](https://github.com/1038lab/ComfyUI-QwenVL) 的 GGUF 加载与图像消息形式。当前节点直接调用已安装的 `llama-cpp-python`，无需运行独立服务。
+### 1. 放入自定义节点目录
+
+```text
+ComfyUI/
+├─ custom_nodes/
+│  └─ ComfyUI-Qwen-gguf/
+└─ models/
+   └─ LLM/
+      └─ Qwen-VL/
+         ├─ your-model.gguf
+         └─ mmproj-your-model.gguf
+```
+
+主模型和 **与它匹配** 的视觉投影文件可以放在 `ComfyUI/models/LLM/` 的任意子目录。纯文本推理可将 `mmproj` 设为 `None`。
+
+### 2. 安装通用依赖
+
+在 **ComfyUI 目录**中，使用 ComfyUI 自己的 Python 运行：
+
+```powershell
+python -m pip install -r "custom_nodes/ComfyUI-Qwen-gguf/requirements.txt"
+```
+
+Windows 便携版请把上面的 `python` 换成其自带的 `python.exe` 完整路径。`requirements.txt` 只安装 Pillow；PyTorch 由 ComfyUI 提供。
+
+### 3. 单独安装视觉版 `llama-cpp-python`
+
+节点需要包含 `Qwen35ChatHandler` 的构建。请从 [JamePeng/llama-cpp-python Releases](https://github.com/JamePeng/llama-cpp-python/releases) 下载与 **操作系统、Python 版本和 GPU 后端** 匹配的 wheel，再用同一个 ComfyUI Python 安装：
+
+```powershell
+python -m pip install "<下载的 wheel 文件路径>"
+python -c "from llama_cpp.llama_chat_format import Qwen35ChatHandler; print('Qwen35ChatHandler OK')"
+```
+
+已用该项目的 `0.3.49` 构建验证 Qwen 3.5 视觉推理和 CUDA 后端。已有可用的 CUDA wheel 时，无需重新安装；也不要仅为满足依赖而用普通 `pip install llama-cpp-python` 覆盖它。该 wheel 的选择方法见[上游安装说明](https://github.com/JamePeng/llama-cpp-python#installation)；另可参考 [ComfyUI-QwenVL 的视觉版安装指南](https://github.com/1038lab/ComfyUI-QwenVL/blob/main/docs/LLAMA_CPP_PYTHON_VISION_INSTALL.md)。
+
+完成后重启 ComfyUI，并在节点菜单的 **Qwen/GGUF** 分类中找到两个节点。
+
+## 快速使用
+
+1. 添加 **Qwen 3.5+ GGUF Inference**，选择 `model`；有图像或视频时还要选择匹配的 `mmproj`。
+2. 填写 `user_prompt`，按需修改 `preset_prompt` 与 `system_prompt`。预设内容会放在用户提示词之前；`Empty - Nothing` 不追加预设。
+3. 按输入类型连线。需要更多选项时，添加 **Qwen GGUF Parameters** 并连接到 `parameters`。
+
+| 你的数据 | 连接方式 | 建议模式 |
+| --- | --- | --- |
+| 纯文本 | 不连接媒体输入 | 默认即可 |
+| 单图或普通图片批次 | `image: IMAGE` | `auto` 或 `images` |
+| 图片形式的视频帧批次 | `image: IMAGE` | 手动选 `video`；已知帧率也可填 `video_fps` 后用 `auto` |
+| ComfyUI 原生视频 | `video: VIDEO` | `auto` 或 `video`；帧率自动读取 |
+
+`image` 和 `video` 只能连接一个。`IMAGE` 批次本身不携带“这是视频”的标记或帧率，因此未知帧率的视频帧批次需要手动选 `video` 模式。原生 `VIDEO` 使用自身帧率，忽略 `video_fps`。
+
+## 视频与批次如何处理
+
+- `max_frames` 默认 24。输入超过上限时，节点会从**整段序列均匀抽样**，不会只取前 24 帧；未抽中的帧不参与推理。该上限也适用于普通图片批次。
+- `max_size` 默认 256，限制每帧最长边。小字或 OCR 可适当提高，但显存与处理时间也会增加；0 表示不缩放。
+- 原生 `VIDEO` 的帧率会用于时间戳；图片帧批次可在 Parameters 中填写 `video_fps`。未知帧率时只标注帧序号。
+- 音轨不参与推理。当前实现把视频整理成有序图片帧发送给视觉处理器，并不发送原生视频媒体消息。
+- ComfyUI 的原生视频对象可能在抽样前先解码整段视频。长视频建议先在上游裁剪或分段。
+
+| `inference_mode` | 行为 |
+| --- | --- |
+| `images` | 将抽中的图片放进一次多模态请求 |
+| `video` | 将抽中的帧按时间顺序放进一次请求，并添加视频分析指令 |
+| `one by one` | 每帧单独分析，再用一次文本请求汇总；N 帧通常会调用模型 N+1 次 |
+| `auto` | 最多 8 帧且估计图像 token 不超过上下文 60% 时，按输入类型选择 `images` 或 `video`；否则选择 `one by one` |
+
+`auto` 的 token 估计是启发式规则，不能保证每个 GGUF 都适合当前上下文。视频帧较多而又希望减少模型调用次数时，可手动选择 `video`，并调整 `max_frames`、`max_size` 与 `context_size`。
+
+## 节点与参数
+
+**推理节点**保留常用选项：`attention_mode`（llama.cpp Flash Attention 的 `auto/on/off`）、`context_size`、`gpu_layers`、`keep_model_loaded` 和 `seed`。`gpu_layers=0` 表示不请求模型层 GPU 卸载；量化等级由所选 GGUF 文件决定。关闭 `keep_model_loaded` 会在本次推理后释放模型。
+
+**Parameters 节点**可选；不连接时使用内置默认值。一个参数节点可以连接多个推理节点。
+
+| 参数 | 作用 |
+| --- | --- |
+| `enable_thinking`、`reasoning_budget` | 启用思考模板并设置预算；预算 `-1` 不限制。当前处理器开启思考时需要 mmproj |
+| `max_tokens`、`temperature`、`top_k`、`top_p`、`min_p`、`typical_p` | 输出长度和采样策略 |
+| `repeat_penalty`、`frequency_penalty`、`presence_penalty` | 重复与话题惩罚 |
+| `mirostat_mode`、`mirostat_eta`、`mirostat_tau` | 自适应采样；模式 0 关闭 |
+| `inference_mode`、`max_frames`、`max_size`、`video_fps` | 批次/视频处理，见上文 |
+| `image_max_tokens` | 单图视觉 token 上限；`-1` 使用模型元数据默认值 |
+| `n_batch`、`n_threads` | llama.cpp 批次与 CPU 线程；线程数 0 用后端默认值 |
+| `mtp_draft_tokens`、`mtp_draft_p_min` | MTP 推测解码；草稿 token 数 0 关闭，需兼容的模型及后端 |
+
+`stats_json` 返回 token 用量、所选模式、总帧数、抽样帧数、模型调用次数，以及可用的 MTP 统计。`gpu_layers_effective` 表示节点传给后端的 GPU 层数参数，并不是显存占用量或实际卸载层数的独立测量。
+
+## 常见问题
+
+**找不到 `Qwen35ChatHandler`**：确认安装的是带该处理器的 wheel，且安装命令使用的是 ComfyUI 自己的 Python；可运行上面的导入检查。
+
+**GPU 利用率低、CPU 很忙**：检查 wheel 是否包含对应 GPU 后端，确认 `gpu_layers` 大于 0。`stats_json` 中该参数为 0 时，节点没有请求模型层 GPU 卸载。模型超过可用显存时，可换更小的 GGUF、降低上下文或释放其他显存占用。
+
+**视频很慢**：`auto` 对较多帧可能选择 `one by one`，导致多次模型调用。尝试 `video` 模式，或降低 `max_frames`。首次运行还包含模型加载时间。
+
+**输出内容看不到视频中的短暂事件**：提高 `max_frames`，或把长视频切成多个短片段分别处理。均匀抽样无法观察未选中的帧。
+
+## 项目来源
+
+实现参考了 [ComfyUI-llama-cpp_vlm](https://github.com/lihaoyun6/ComfyUI-llama-cpp_vlm) 与 [ComfyUI-QwenVL](https://github.com/1038lab/ComfyUI-QwenVL)，仅保留本项目需要的 GGUF 工作流。MTP 细节可查阅 [llama.cpp 推测解码文档](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)。

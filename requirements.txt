@@ -1,0 +1,7 @@
+Pillow>=9.1
+
+# Install llama-cpp-python separately from a wheel matching your OS, Python,
+# and GPU backend. This node requires Qwen35ChatHandler; a generic pip install
+# may replace a working CUDA wheel with an incompatible build.
+# https://github.com/JamePeng/llama-cpp-python/releases
+# PyTorch is supplied by ComfyUI.
