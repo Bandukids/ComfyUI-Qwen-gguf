@@ -8,7 +8,7 @@
 2. 在 **ComfyUI 自己的 Python 环境**中安装带有 `Qwen35ChatHandler` 的 `llama-cpp-python`。推荐使用 [JamePeng/llama-cpp-python](https://github.com/JamePeng/llama-cpp-python)；可在 [Releases 页面](https://github.com/JamePeng/llama-cpp-python/releases)按操作系统、Python 版本和 GPU 后端选择预编译 wheel。该项目的 `0.3.49` 版本已验证提供所需接口。如果已安装近期版本的 `ComfyUI-QwenVL` 及其 GGUF 依赖，通常可以复用，不需要 `llama-server`。
 3. 将主模型 `.gguf` 和**匹配该模型的**视觉投影文件 `mmproj*.gguf` 放进 `ComfyUI/models/LLM/` 的任意子目录（例如 `LLM/Qwen-VL/` 或 `LLM/GGUF/`）。重启或刷新节点后选择两个文件。纯文本推理时 `mmproj` 可以选 `None`。
 
-节点还使用 ComfyUI 自带的 PyTorch 和 Pillow。安装 wheel 时请使用 ComfyUI 的 Python，而不是系统 Python。GPU 推理依赖带相应 GPU 后端的构建；若当前构建不支持 GPU，节点会自动使用 CPU 并在控制台提示。
+节点还使用 ComfyUI 自带的 PyTorch 和 Pillow。安装 wheel 时请使用 ComfyUI 的 Python，而不是系统 Python。GPU 推理依赖带相应 GPU 后端的构建；节点会在检测前注册动态 ggml 后端。若当前构建仍不支持 GPU，节点会自动使用 CPU 并在控制台提示。可在 `stats_json` 的 `gpu_layers_effective` 查看本次模型实际采用的 GPU 层数；0 表示没有模型层卸载到 GPU。
 
 ## 节点用法
 

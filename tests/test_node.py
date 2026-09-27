@@ -195,6 +195,45 @@ class QwenNodeTests(unittest.TestCase):
             node.infer(**self.base_options())
         self.assertEqual(len(FakeLlama.instances), 1)
 
+    def test_dynamic_gpu_backend_is_registered_before_offload_check(self):
+        llama_cpp = sys.modules["llama_cpp"]
+        original_support = llama_cpp.llama_supports_gpu_offload
+        original_init = getattr(llama_cpp, "llama_backend_init", None)
+        original_file = getattr(llama_cpp, "__file__", None)
+        original_ggml = sys.modules.get("llama_cpp._ggml")
+        state = {"loaded": False, "initialized": False}
+        try:
+            package = Path(self.temp_dir.name) / "probe_package"
+            (package / "lib").mkdir(parents=True, exist_ok=True)
+            llama_cpp.__file__ = str(package / "__init__.py")
+            llama_cpp.llama_supports_gpu_offload = lambda: state["loaded"]
+            llama_cpp.llama_backend_init = lambda: state.update(initialized=True)
+            ggml = types.ModuleType("llama_cpp._ggml")
+
+            def load_backend(path):
+                self.assertTrue(state["initialized"])
+                self.assertIn(b"lib", path.value)
+                state["loaded"] = True
+
+            ggml.ggml_backend_load_all_from_path = load_backend
+            sys.modules["llama_cpp._ggml"] = ggml
+            self.assertTrue(self.nodes._gpu_offload_available(llama_cpp))
+        finally:
+            llama_cpp.llama_supports_gpu_offload = original_support
+            if original_init is None:
+                if hasattr(llama_cpp, "llama_backend_init"):
+                    del llama_cpp.llama_backend_init
+            else:
+                llama_cpp.llama_backend_init = original_init
+            if original_file is None:
+                del llama_cpp.__file__
+            else:
+                llama_cpp.__file__ = original_file
+            if original_ggml is None:
+                sys.modules.pop("llama_cpp._ggml", None)
+            else:
+                sys.modules["llama_cpp._ggml"] = original_ggml
+
     def test_preset_and_seed_are_forwarded(self):
         options = self.base_options()
         options.update(user_prompt="Focus on the sign.", preset_prompt="Extract Text (OCR)", seed=12345)

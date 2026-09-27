@@ -2,6 +2,7 @@
 
 import atexit
 import base64
+import ctypes
 import gc
 import io
 import json
@@ -81,6 +82,25 @@ def _close_model():
 atexit.register(_close_model)
 
 
+def _gpu_offload_available(llama_cpp):
+    """Register dynamic ggml backends before asking whether CUDA is available."""
+    if llama_cpp.llama_supports_gpu_offload():
+        return True
+    try:
+        from llama_cpp._ggml import ggml_backend_load_all_from_path
+    except ImportError:
+        return False
+    # On Windows, importing torch makes its bundled CUDA runtime DLLs available
+    # to ggml-cuda.dll. ComfyUI normally imports torch before executing nodes.
+    import torch
+
+    llama_cpp.llama_backend_init()
+    lib_dir = Path(llama_cpp.__file__).resolve().parent / "lib"
+    if lib_dir.is_dir():
+        ggml_backend_load_all_from_path(ctypes.c_char_p(str(lib_dir).encode("utf-8")))
+    return llama_cpp.llama_supports_gpu_offload()
+
+
 def _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_mode="auto",
                   *, n_batch=512, n_ubatch=512, n_threads=0, image_max_tokens=-1,
                   enable_thinking=False, mtp_draft_tokens=0, mtp_draft_p_min=0.0):
@@ -94,7 +114,7 @@ def _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_m
             "Install it in ComfyUI's Python environment."
         ) from error
 
-    gpu_available = llama_cpp.llama_supports_gpu_offload()
+    gpu_available = _gpu_offload_available(llama_cpp) if gpu_layers else False
     effective_gpu_layers = gpu_layers if gpu_available else 0
     if attention_mode not in ATTENTION_MODES:
         raise ValueError(f"Unknown attention mode: {attention_mode!r}")
@@ -367,6 +387,7 @@ class QwenGGUFInference:
                     mtp_draft_tokens=params["mtp_draft_tokens"],
                     mtp_draft_p_min=params["mtp_draft_p_min"],
                 )
+                effective_gpu_layers = _CONFIG[3]
                 if mode == "one_by_one" and selected_count > 1:
                     observations = []
                     for index, frame in selected:
@@ -415,6 +436,7 @@ class QwenGGUFInference:
                 if isinstance(value, (int, float)):
                     usage[key] = usage.get(key, 0) + value
         stats = {"usage": usage, "mtp": spec_stats, "inference_mode": mode,
+                 "gpu_layers_effective": effective_gpu_layers,
                  "total_frames": int(media.shape[0]) if media is not None else 0,
                  "selected_frames": selected_count, "model_calls": len(results)}
         return (answer, reasoning, json.dumps(stats, ensure_ascii=False, default=str))
