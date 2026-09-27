@@ -150,6 +150,8 @@ class QwenNodeTests(unittest.TestCase):
         self.assertTrue(options["seed"][1]["control_after_generate"])
         param_names = list(self.nodes.QwenGGUFParameters.INPUT_TYPES()["required"])
         self.assertEqual(param_names[:2], ["enable_thinking", "reasoning_budget"])
+        self.assertEqual(self.nodes.QwenGGUFParameters.INPUT_TYPES()["required"]["inference_mode"][0],
+                         ["auto", "one by one", "images", "video"])
 
     def base_options(self, mmproj="None"):
         return dict(model=str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), mmproj=mmproj,
@@ -276,12 +278,16 @@ class QwenNodeTests(unittest.TestCase):
         video = types.SimpleNamespace(get_components=lambda: types.SimpleNamespace(
             images=frames, frame_rate=2))
         params = self.parameter_options()
-        params.update(inference_mode="all at once", max_frames=3, max_size=2)
+        params.update(inference_mode="video", max_frames=3, max_size=2)
         options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
         answer, _, stats = self.nodes.QwenGGUFInference().infer(
             **options, video=video, parameters=params)
         self.assertEqual(answer, "two images")
         self.assertIn('"selected_frames": 3', stats)
+        self.assertIn('"total_frames": 5', stats)
+        self.assertIn('"inference_mode": "video"', stats)
+        self.assertIn("Treat the ordered frames as one video sequence",
+                      FakeLlama.calls[0]["messages"][0]["content"])
         content = FakeLlama.calls[0]["messages"][-1]["content"]
         self.assertEqual([item["text"] for item in content if item["type"] == "text"][1:],
                          ["Frame 1 (0.00s):", "Frame 3 (1.00s):", "Frame 5 (2.00s):"])
@@ -304,9 +310,27 @@ class QwenNodeTests(unittest.TestCase):
 
     def test_auto_mode_uses_frame_count_and_context(self):
         params = self.parameter_options()
-        self.assertEqual(self.nodes._mode(2, params, 8192), "all_at_once")
+        self.assertEqual(self.nodes._mode(2, params, 8192), "images")
+        self.assertEqual(self.nodes._mode(2, params, 8192, has_video=True), "video")
         self.assertEqual(self.nodes._mode(12, params, 8192), "one_by_one")
         self.assertEqual(self.nodes._mode(4, params, 512), "one_by_one")
+
+    def test_video_over_limit_samples_across_entire_clip(self):
+        frames = FakeTensor(np.zeros((240, 2, 2, 3), dtype=np.float32))
+        video = types.SimpleNamespace(get_components=lambda: types.SimpleNamespace(
+            images=frames, frame_rate=24))
+        params = self.parameter_options()
+        params.update(inference_mode="video", max_frames=24)
+        options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
+        _, _, stats = self.nodes.QwenGGUFInference().infer(
+            **options, video=video, parameters=params)
+        labels = [item["text"] for item in FakeLlama.calls[0]["messages"][-1]["content"]
+                  if item["type"] == "text"][1:]
+        self.assertEqual(len(labels), 24)
+        self.assertEqual(labels[0], "Frame 1 (0.00s):")
+        self.assertEqual(labels[-1], "Frame 240 (9.96s):")
+        self.assertIn('"total_frames": 240', stats)
+        self.assertIn('"selected_frames": 24', stats)
 
     def test_image_and_video_are_exclusive(self):
         frames = FakeTensor(np.zeros((1, 2, 2, 3), dtype=np.float32))

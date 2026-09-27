@@ -177,7 +177,8 @@ def _select_frames(image, max_frames):
     return [(index, frame) for index, frame in enumerate(image) if index in selected]
 
 
-def _messages(system_prompt, user_prompt, frames=None, max_size=0, frame_rate=None):
+def _messages(system_prompt, user_prompt, frames=None, max_size=0, frame_rate=None,
+              as_video=False):
     messages = []
     if system_prompt.strip():
         messages.append({"role": "system", "content": system_prompt})
@@ -189,6 +190,8 @@ def _messages(system_prompt, user_prompt, frames=None, max_size=0, frame_rate=No
     for index, frame in frames:
         if frame_rate is not None:
             content.append({"type": "text", "text": f"Frame {index + 1} ({index / frame_rate:.2f}s):"})
+        elif as_video:
+            content.append({"type": "text", "text": f"Frame {index + 1}:"})
         elif len(frames) > 1:
             content.append({"type": "text", "text": f"Image {index + 1}:"})
         content.append({"type": "image_url", "image_url": {"url": _image_data_url(frame, max_size)}})
@@ -215,15 +218,16 @@ def _response_parts(result):
         raise RuntimeError(f"Unexpected llama-cpp-python response: {str(result)[:1000]}") from error
 
 
-def _mode(selected_count, params, context_size):
+def _mode(selected_count, params, context_size, has_video=False):
     requested = params["inference_mode"].replace(" ", "_")
-    if requested not in ("auto", "all_at_once", "one_by_one"):
+    if requested not in ("auto", "images", "video", "one_by_one"):
         raise ValueError(f"Unknown inference_mode: {requested!r}")
     if requested != "auto":
         return requested
     estimated_image_tokens = params["image_max_tokens"] if params["image_max_tokens"] > 0 else 512
-    return "all_at_once" if (selected_count <= 8 and
-                             selected_count * estimated_image_tokens <= context_size * 0.6) else "one_by_one"
+    if selected_count <= 8 and selected_count * estimated_image_tokens <= context_size * 0.6:
+        return "video" if has_video else "images"
+    return "one_by_one"
 
 
 def _prompt_with_preset(preset_prompt, user_prompt):
@@ -241,7 +245,7 @@ class QwenGGUFParameters:
         return {"required": {
             "enable_thinking": ("BOOLEAN", {"default": False}),
             "reasoning_budget": ("INT", {"default": -1, "min": -1, "max": 32768}),
-            "inference_mode": (["auto", "all at once", "one by one"],),
+            "inference_mode": (["auto", "one by one", "images", "video"],),
             "max_frames": ("INT", {"default": 24, "min": 1, "max": 1024}),
             "max_size": ("INT", {"default": 256, "min": 0, "max": 4096}),
             "max_tokens": ("INT", {"default": 1024, "min": 1, "max": 32768}),
@@ -330,7 +334,7 @@ class QwenGGUFInference:
                 raise ValueError("VIDEO frame rate must be positive.")
         selected = _select_frames(media, params["max_frames"]) if media is not None else None
         selected_count = len(selected) if selected is not None else 0
-        mode = _mode(selected_count, params, context_size)
+        mode = _mode(selected_count, params, context_size, video is not None)
         model_path = _model_path(model)
         mmproj_path = None if mmproj == "None" else _model_path(mmproj)
         if media is not None and mmproj_path is None:
@@ -385,8 +389,16 @@ class QwenGGUFInference:
                                       "\n".join(observations))
                     messages = _messages(system_prompt, summary_prompt)
                 else:
-                    messages = _messages(system_prompt, prompt, selected,
-                                         params["max_size"], frame_rate)
+                    request_system_prompt = system_prompt
+                    if mode == "video" and selected_count:
+                        request_system_prompt = "\n\n".join(part for part in (
+                            system_prompt.strip(),
+                            "Treat the ordered frames as one video sequence. Describe only visible "
+                            "changes; do not invent motion or events between sampled frames.",
+                        ) if part)
+                    messages = _messages(request_system_prompt, prompt, selected,
+                                         params["max_size"], frame_rate if mode == "video" else None,
+                                         as_video=mode == "video")
                 result = llm.create_chat_completion(
                     messages=messages, max_tokens=params["max_tokens"], **completion_options,
                 )
@@ -403,5 +415,6 @@ class QwenGGUFInference:
                 if isinstance(value, (int, float)):
                     usage[key] = usage.get(key, 0) + value
         stats = {"usage": usage, "mtp": spec_stats, "inference_mode": mode,
+                 "total_frames": int(media.shape[0]) if media is not None else 0,
                  "selected_frames": selected_count, "model_calls": len(results)}
         return (answer, reasoning, json.dumps(stats, ensure_ascii=False, default=str))
