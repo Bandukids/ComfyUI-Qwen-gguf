@@ -4,6 +4,7 @@ import atexit
 import base64
 import gc
 import io
+import json
 from pathlib import Path
 import threading
 
@@ -57,7 +58,9 @@ def _close_model():
 atexit.register(_close_model)
 
 
-def _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_mode="auto"):
+def _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_mode="auto",
+                  *, n_batch=512, n_ubatch=512, n_threads=0, image_max_tokens=-1,
+                  enable_thinking=False, mtp_draft_tokens=0, mtp_draft_p_min=0.0):
     global _MODEL, _CONFIG
     try:
         import llama_cpp
@@ -72,7 +75,11 @@ def _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_m
     effective_gpu_layers = gpu_layers if gpu_available else 0
     if attention_mode not in ATTENTION_MODES:
         raise ValueError(f"Unknown attention mode: {attention_mode!r}")
-    config = (model_path, mmproj_path, context_size, effective_gpu_layers, attention_mode)
+    if n_ubatch > n_batch:
+        raise ValueError("n_ubatch cannot exceed n_batch.")
+    config = (model_path, mmproj_path, context_size, effective_gpu_layers, attention_mode,
+              n_batch, n_ubatch, n_threads, image_max_tokens, enable_thinking,
+              mtp_draft_tokens, mtp_draft_p_min)
     if _MODEL is not None and _CONFIG == config:
         return _MODEL
 
@@ -85,17 +92,35 @@ def _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_m
         if mmproj_path is not None:
             handler = Qwen35ChatHandler(
                 mmproj_path=mmproj_path, use_gpu=gpu_available,
-                enable_thinking=False, verbose=False,
+                enable_thinking=enable_thinking, image_max_tokens=image_max_tokens,
+                verbose=False,
+            )
+        speculative = None
+        if mtp_draft_tokens:
+            try:
+                from llama_cpp.llama_speculative import SpecConfig, SpeculativeType
+            except ImportError as error:
+                raise RuntimeError("This llama-cpp-python build does not provide MTP speculative decoding.") from error
+            speculative = SpecConfig(
+                spec_type=SpeculativeType.DRAFT_MTP,
+                draft_n_max=mtp_draft_tokens,
+                draft_p_min=mtp_draft_p_min,
             )
         model = llama_cpp.Llama(
             model_path=model_path, n_ctx=context_size,
-            n_gpu_layers=effective_gpu_layers, n_batch=512,
+            n_gpu_layers=effective_gpu_layers, n_batch=n_batch, n_ubatch=n_ubatch,
+            n_threads=n_threads or None, speculative=speculative,
             swa_full=True, chat_handler=handler, verbose=False,
             flash_attn_type=ATTENTION_MODES[attention_mode],
         )
-    except Exception:
+    except Exception as error:
         if handler is not None:
             handler.close()
+        if mtp_draft_tokens:
+            raise RuntimeError(
+                "MTP initialization failed. Check that the selected GGUF contains compatible "
+                "MTP layers and that this llama-cpp-python build supports draft-mtp."
+            ) from error
         raise
 
     _MODEL, _CONFIG = model, config
@@ -116,7 +141,7 @@ def _image_data_url(frame):
     return f"data:image/png;base64,{encoded}"
 
 
-def _messages(system_prompt, user_prompt, image):
+def _messages(system_prompt, user_prompt, image, max_images=0):
     messages = []
     if system_prompt.strip():
         messages.append({"role": "system", "content": system_prompt})
@@ -126,9 +151,16 @@ def _messages(system_prompt, user_prompt, image):
 
     if image.ndim != 4 or image.shape[0] == 0:
         raise ValueError("IMAGE must be a non-empty [batch, height, width, channels] tensor.")
+    total = image.shape[0]
+    count = min(total, max_images) if max_images else total
+    indices = ([0] if count == 1 else
+               [round(position * (total - 1) / (count - 1)) for position in range(count)])
+    selected = set(indices)
     content = [{"type": "text", "text": user_prompt}]
     for index, frame in enumerate(image):
-        if image.shape[0] > 1:
+        if index not in selected:
+            continue
+        if count > 1:
             content.append({"type": "text", "text": f"Image {index + 1}:"})
         content.append({"type": "image_url", "image_url": {"url": _image_data_url(frame)}})
     messages.append({"role": "user", "content": content})
@@ -196,5 +228,102 @@ class QwenGGUFInference:
             if not isinstance(answer, str):
                 raise ValueError("non-text response")
             return (answer,)
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            raise RuntimeError(f"Unexpected llama-cpp-python response: {str(result)[:1000]}") from error
+
+
+class QwenGGUFInferenceAdvanced(QwenGGUFInference):
+    """Expose GGUF load options, samplers, thinking, and built-in MTP."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = super().INPUT_TYPES()
+        inputs["required"].update({
+            "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "top_k": ("INT", {"default": 40, "min": 0, "max": 1000}),
+            "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "repetition_penalty": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.01}),
+            "penalty_last_n": ("INT", {"default": 64, "min": -1, "max": 8192}),
+            "frequency_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05}),
+            "presence_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05}),
+            "mirostat_mode": (["off", "v1", "v2"],),
+            "mirostat_tau": ("FLOAT", {"default": 5.0, "min": 0.1, "max": 20.0, "step": 0.1}),
+            "mirostat_eta": ("FLOAT", {"default": 0.1, "min": 0.001, "max": 1.0, "step": 0.01}),
+            "enable_thinking": ("BOOLEAN", {"default": False}),
+            "reasoning_budget": ("INT", {"default": -1, "min": -1, "max": 32768}),
+            "max_images": ("INT", {"default": 0, "min": 0, "max": 1024}),
+            "image_max_tokens": ("INT", {"default": -1, "min": -1, "max": 16384}),
+            "n_batch": ("INT", {"default": 512, "min": 32, "max": 8192}),
+            "n_ubatch": ("INT", {"default": 512, "min": 32, "max": 8192}),
+            "n_threads": ("INT", {"default": 0, "min": 0, "max": 128}),
+            "mtp_draft_tokens": ("INT", {"default": 0, "min": 0, "max": 32}),
+            "mtp_draft_p_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+        })
+        return inputs
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("response", "reasoning", "stats_json")
+    FUNCTION = "infer"
+
+    def infer(self, **options):
+        model_path = _model_path(options["model"])
+        mmproj_path = None if options["mmproj"] == "None" else _model_path(options["mmproj"])
+        image = options.get("image")
+        if image is not None and mmproj_path is None:
+            raise ValueError("Image input requires the matching mmproj GGUF file.")
+        if options["enable_thinking"] and mmproj_path is None:
+            raise ValueError("enable_thinking requires mmproj: the Qwen35ChatHandler controls this template option.")
+        if options["mtp_draft_tokens"] and options["mtp_draft_tokens"] >= options["n_batch"]:
+            raise ValueError("mtp_draft_tokens must be smaller than n_batch.")
+
+        messages = _messages(
+            options["system_prompt"],
+            _prompt_with_preset(options["preset_prompt"], options["user_prompt"]),
+            image, options["max_images"],
+        )
+        with _LOCK:
+            try:
+                llm = _ensure_model(
+                    model_path, mmproj_path, options["context_size"], options["gpu_layers"],
+                    options["attention_mode"], n_batch=options["n_batch"],
+                    n_ubatch=options["n_ubatch"], n_threads=options["n_threads"],
+                    image_max_tokens=options["image_max_tokens"],
+                    enable_thinking=options["enable_thinking"],
+                    mtp_draft_tokens=options["mtp_draft_tokens"],
+                    mtp_draft_p_min=options["mtp_draft_p_min"],
+                )
+                result = llm.create_chat_completion(
+                    messages=messages, max_tokens=options["max_tokens"],
+                    temperature=options["temperature"], top_p=options["top_p"],
+                    top_k=options["top_k"], min_p=options["min_p"],
+                    repeat_penalty=options["repetition_penalty"],
+                    penalty_last_n=options["penalty_last_n"],
+                    frequency_penalty=options["frequency_penalty"],
+                    presence_penalty=options["presence_penalty"],
+                    mirostat_mode={"off": 0, "v1": 1, "v2": 2}[options["mirostat_mode"]],
+                    mirostat_tau=options["mirostat_tau"], mirostat_eta=options["mirostat_eta"],
+                    reasoning_budget=options["reasoning_budget"] if options["enable_thinking"] else -1,
+                    seed=options["seed"],
+                )
+                spec_stats = getattr(llm, "last_speculative_stats", {}) if options["mtp_draft_tokens"] else {}
+            finally:
+                if not options["keep_model_loaded"]:
+                    _close_model()
+
+        try:
+            message = result["choices"][0]["message"]
+            answer = message.get("content") or ""
+            reasoning = message.get("reasoning_content") or ""
+            if isinstance(answer, list):
+                answer = "".join(part.get("text", "") for part in answer if isinstance(part, dict))
+            if not isinstance(answer, str) or not isinstance(reasoning, str):
+                raise ValueError("non-text response")
+            if "<think>" in answer and "</think>" in answer:
+                prefix, rest = answer.split("<think>", 1)
+                thought, suffix = rest.split("</think>", 1)
+                reasoning = reasoning or thought.strip()
+                answer = (prefix + suffix).strip()
+            stats = {"usage": result.get("usage", {}), "mtp": spec_stats}
+            return (answer, reasoning, json.dumps(stats, ensure_ascii=False, default=str))
         except (KeyError, IndexError, TypeError, ValueError) as error:
             raise RuntimeError(f"Unexpected llama-cpp-python response: {str(result)[:1000]}") from error

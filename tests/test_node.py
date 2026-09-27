@@ -59,7 +59,8 @@ class FakeLlama:
     def create_chat_completion(self, **kwargs):
         self.completion_kwargs = kwargs
         self.messages = kwargs["messages"]
-        return {"choices": [{"message": {"content": "two images"}}]}
+        return {"choices": [{"message": {"content": "two images"}}],
+                "usage": {"completion_tokens": 3}}
 
     def close(self):
         self.closed = True
@@ -75,6 +76,11 @@ class FakeHandler:
 
     def close(self):
         self.closed = True
+
+
+class FakeSpecConfig:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 
 
 class QwenNodeTests(unittest.TestCase):
@@ -97,11 +103,16 @@ class QwenNodeTests(unittest.TestCase):
         llama_cpp.llama_supports_gpu_offload = lambda: False
         chat_format = types.ModuleType("llama_cpp.llama_chat_format")
         chat_format.Qwen35ChatHandler = FakeHandler
+        speculative = types.ModuleType("llama_cpp.llama_speculative")
+        speculative.SpecConfig = FakeSpecConfig
+        speculative.SpeculativeType = types.SimpleNamespace(DRAFT_MTP=3)
 
         cls.original_modules = {name: sys.modules.get(name) for name in
-                                ("folder_paths", "llama_cpp", "llama_cpp.llama_chat_format")}
+                                ("folder_paths", "llama_cpp", "llama_cpp.llama_chat_format",
+                                 "llama_cpp.llama_speculative")}
         sys.modules.update({"folder_paths": folder_paths, "llama_cpp": llama_cpp,
-                            "llama_cpp.llama_chat_format": chat_format})
+                            "llama_cpp.llama_chat_format": chat_format,
+                            "llama_cpp.llama_speculative": speculative})
         spec = importlib.util.spec_from_file_location("qwen_test_nodes", Path(__file__).parents[1] / "nodes.py")
         cls.nodes = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.nodes)
@@ -193,6 +204,56 @@ class QwenNodeTests(unittest.TestCase):
     def test_invalid_path_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Invalid GGUF"):
             self.nodes._model_path("../outside.gguf")
+
+    def advanced_options(self, mmproj="None"):
+        required = self.nodes.QwenGGUFInferenceAdvanced.INPUT_TYPES()["required"]
+        options = {name: spec[1].get("default") if len(spec) > 1 and isinstance(spec[1], dict) else spec[0][0]
+                   for name, spec in required.items()}
+        options.update(model=str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"),
+                       mmproj=mmproj, user_prompt="describe")
+        return options
+
+    def test_advanced_sampler_and_batch_limits(self):
+        options = self.advanced_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
+        options.update(top_p=0.8, top_k=30, min_p=0.1, repetition_penalty=1.2,
+                       frequency_penalty=0.4, presence_penalty=0.3,
+                       mirostat_mode="v2", n_batch=1024, n_ubatch=256,
+                       n_threads=4, image_max_tokens=600, max_images=2,
+                       enable_thinking=True, reasoning_budget=80,
+                       image=FakeTensor(np.zeros((4, 2, 2, 3), dtype=np.float32)))
+        answer, reasoning, stats = self.nodes.QwenGGUFInferenceAdvanced().infer(**options)
+        self.assertEqual((answer, reasoning), ("two images", ""))
+        self.assertIn('"completion_tokens": 3', stats)
+        instance = FakeLlama.instances[0]
+        self.assertEqual(instance.kwargs["n_ubatch"], 256)
+        self.assertEqual(instance.kwargs["n_threads"], 4)
+        self.assertEqual(FakeHandler.instances[0].kwargs["image_max_tokens"], 600)
+        self.assertTrue(FakeHandler.instances[0].kwargs["enable_thinking"])
+        request = instance.completion_kwargs
+        for name, value in (("top_p", 0.8), ("top_k", 30), ("min_p", 0.1),
+                            ("repeat_penalty", 1.2), ("frequency_penalty", 0.4),
+                            ("presence_penalty", 0.3), ("mirostat_mode", 2),
+                            ("reasoning_budget", 80)):
+            self.assertEqual(request[name], value)
+        self.assertEqual([part["text"] for part in request["messages"][-1]["content"]
+                          if part["type"] == "text"][1:], ["Image 1:", "Image 4:"])
+
+    def test_mtp_uses_speculative_config_and_reloads(self):
+        options = self.advanced_options()
+        node = self.nodes.QwenGGUFInferenceAdvanced()
+        node.infer(**options)
+        first = FakeLlama.instances[0]
+        options.update(mtp_draft_tokens=4, mtp_draft_p_min=0.15)
+        node.infer(**options)
+        self.assertTrue(first.closed)
+        spec = FakeLlama.instances[1].kwargs["speculative"]
+        self.assertEqual((spec.spec_type, spec.draft_n_max, spec.draft_p_min), (3, 4, 0.15))
+
+    def test_thinking_requires_projector(self):
+        options = self.advanced_options()
+        options["enable_thinking"] = True
+        with self.assertRaisesRegex(ValueError, "requires mmproj"):
+            self.nodes.QwenGGUFInferenceAdvanced().infer(**options)
 
 
 if __name__ == "__main__":
