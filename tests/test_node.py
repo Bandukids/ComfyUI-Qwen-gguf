@@ -57,6 +57,7 @@ class FakeLlama:
         self.instances.append(self)
 
     def create_chat_completion(self, **kwargs):
+        self.completion_kwargs = kwargs
         self.messages = kwargs["messages"]
         return {"choices": [{"message": {"content": "two images"}}]}
 
@@ -124,6 +125,7 @@ class QwenNodeTests(unittest.TestCase):
         options = self.nodes.QwenGGUFInference.INPUT_TYPES()["required"]
         self.assertIn(str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), options["model"][0])
         self.assertIn(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"), options["mmproj"][0])
+        self.assertTrue(options["seed"][1]["control_after_generate"])
 
     def test_batch_is_one_ordered_multimodal_request(self):
         pixels = np.zeros((2, 2, 2, 3), dtype=np.float32)
@@ -138,6 +140,7 @@ class QwenNodeTests(unittest.TestCase):
         self.assertEqual(result, ("two images",))
         self.assertEqual(len(FakeLlama.instances), 1)
         self.assertEqual(FakeLlama.instances[0].kwargs["n_gpu_layers"], 0)
+        self.assertEqual(FakeLlama.instances[0].kwargs["flash_attn_type"], -1)
         self.assertEqual(FakeHandler.instances[0].kwargs["enable_thinking"], False)
         messages = FakeLlama.instances[0].messages
         self.assertEqual(messages[0], {"role": "system", "content": "system"})
@@ -158,6 +161,26 @@ class QwenNodeTests(unittest.TestCase):
             node.infer(str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), "None", "", "hello",
                        10, 0, 8192, 0)
         self.assertEqual(len(FakeLlama.instances), 1)
+
+    def test_preset_and_seed_are_forwarded(self):
+        node = self.nodes.QwenGGUFInference()
+        node.infer(str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), "None", "", "Focus on the sign.",
+                   10, 0, 8192, 0, preset_prompt="Extract Text (OCR)", seed=12345)
+        request = FakeLlama.instances[0].completion_kwargs
+        self.assertEqual(request["seed"], 12345)
+        self.assertIn("Transcribe all readable text", request["messages"][0]["content"])
+        self.assertIn("Focus on the sign.", request["messages"][0]["content"])
+
+    def test_attention_change_reloads_and_keep_off_releases(self):
+        node = self.nodes.QwenGGUFInference()
+        args = (str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), "None", "", "hello", 10, 0, 8192, 0)
+        node.infer(*args)
+        first = FakeLlama.instances[0]
+        node.infer(*args, attention_mode="disabled", keep_model_loaded=False)
+        self.assertTrue(first.closed)
+        self.assertEqual(FakeLlama.instances[1].kwargs["flash_attn_type"], 0)
+        self.assertTrue(FakeLlama.instances[1].closed)
+        self.assertIsNone(self.nodes._MODEL)
 
     def test_image_requires_projector(self):
         image = FakeTensor(np.zeros((1, 1, 1, 3), dtype=np.float32))

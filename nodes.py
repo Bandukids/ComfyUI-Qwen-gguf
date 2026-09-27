@@ -19,6 +19,16 @@ _LOCK = threading.RLock()
 _MODEL = None
 _CONFIG = None
 
+PROMPT_PRESETS = {
+    "None": "",
+    "Detailed Description": "Describe the image in detail, including its subjects, setting, actions, and visible text.",
+    "Brief Description": "Describe the image briefly and accurately.",
+    "Extract Text (OCR)": "Transcribe all readable text in the image. Preserve its original language and line breaks.",
+    "Compare Images": "Compare the images in order. Explain their important similarities and differences.",
+}
+
+ATTENTION_MODES = {"auto": -1, "disabled": 0, "enabled": 1}
+
 
 def _gguf_files():
     return [name for name in folder_paths.get_filename_list(MODEL_CATEGORY)
@@ -47,7 +57,7 @@ def _close_model():
 atexit.register(_close_model)
 
 
-def _ensure_model(model_path, mmproj_path, context_size, gpu_layers):
+def _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_mode="auto"):
     global _MODEL, _CONFIG
     try:
         import llama_cpp
@@ -60,7 +70,9 @@ def _ensure_model(model_path, mmproj_path, context_size, gpu_layers):
 
     gpu_available = llama_cpp.llama_supports_gpu_offload()
     effective_gpu_layers = gpu_layers if gpu_available else 0
-    config = (model_path, mmproj_path, context_size, effective_gpu_layers)
+    if attention_mode not in ATTENTION_MODES:
+        raise ValueError(f"Unknown attention mode: {attention_mode!r}")
+    config = (model_path, mmproj_path, context_size, effective_gpu_layers, attention_mode)
     if _MODEL is not None and _CONFIG == config:
         return _MODEL
 
@@ -79,6 +91,7 @@ def _ensure_model(model_path, mmproj_path, context_size, gpu_layers):
             model_path=model_path, n_ctx=context_size,
             n_gpu_layers=effective_gpu_layers, n_batch=512,
             swa_full=True, chat_handler=handler, verbose=False,
+            flash_attn_type=ATTENTION_MODES[attention_mode],
         )
     except Exception:
         if handler is not None:
@@ -122,6 +135,13 @@ def _messages(system_prompt, user_prompt, image):
     return messages
 
 
+def _prompt_with_preset(preset_prompt, user_prompt):
+    if preset_prompt not in PROMPT_PRESETS:
+        raise ValueError(f"Unknown prompt preset: {preset_prompt!r}")
+    preset = PROMPT_PRESETS[preset_prompt]
+    return "\n\n".join(part for part in (preset, user_prompt.strip()) if part)
+
+
 class QwenGGUFInference:
     @classmethod
     def INPUT_TYPES(cls):
@@ -133,11 +153,15 @@ class QwenGGUFInference:
                 "model": (models or ["No GGUF model found"],),
                 "mmproj": (["None"] + projectors,),
                 "system_prompt": ("STRING", {"multiline": True, "default": "You are a helpful assistant."}),
+                "preset_prompt": (list(PROMPT_PRESETS),),
                 "user_prompt": ("STRING", {"multiline": True, "default": "Describe this image."}),
                 "max_tokens": ("INT", {"default": 512, "min": 1, "max": 32768}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "attention_mode": (list(ATTENTION_MODES),),
                 "context_size": ("INT", {"default": 8192, "min": 512, "max": 262144}),
                 "gpu_layers": ("INT", {"default": 99, "min": 0, "max": 999}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffff, "control_after_generate": True}),
             },
             "optional": {"image": ("IMAGE",)},
         }
@@ -148,17 +172,22 @@ class QwenGGUFInference:
     CATEGORY = "Qwen/GGUF"
 
     def infer(self, model, mmproj, system_prompt, user_prompt, max_tokens, temperature,
-              context_size, gpu_layers, image=None):
+              context_size, gpu_layers, image=None, preset_prompt="None",
+              attention_mode="auto", keep_model_loaded=True, seed=0):
         model_path = _model_path(model)
         mmproj_path = None if mmproj == "None" else _model_path(mmproj)
         if image is not None and mmproj_path is None:
             raise ValueError("Image input requires the matching mmproj GGUF file.")
-        messages = _messages(system_prompt, user_prompt, image)
+        messages = _messages(system_prompt, _prompt_with_preset(preset_prompt, user_prompt), image)
         with _LOCK:
-            llm = _ensure_model(model_path, mmproj_path, context_size, gpu_layers)
-            result = llm.create_chat_completion(
-                messages=messages, max_tokens=max_tokens, temperature=temperature,
-            )
+            try:
+                llm = _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_mode)
+                result = llm.create_chat_completion(
+                    messages=messages, max_tokens=max_tokens, temperature=temperature, seed=seed,
+                )
+            finally:
+                if not keep_model_loaded:
+                    _close_model()
         try:
             message = result["choices"][0]["message"]
             answer = message.get("content") or message.get("reasoning_content")
