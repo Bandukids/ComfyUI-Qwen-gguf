@@ -138,6 +138,29 @@ class QwenNodeTests(unittest.TestCase):
         FakeLlama.response = {"choices": [{"message": {"content": "two images"}}],
                               "usage": {"completion_tokens": 3}}
 
+    def test_response_excludes_thinking(self):
+        cases = [
+            ("<think>private reasoning</think>Final answer", "Final answer", "private reasoning"),
+            ("private reasoning</think>\nFinal answer", "Final answer", "private reasoning"),
+            ("<think>first</think><think>second</think>Final", "Final", "first\n\nsecond"),
+            ("<think>unfinished reasoning", "", "unfinished reasoning"),
+            ("<THINK>reasoning</THINK>Final", "Final", "reasoning"),
+            ("Final answer", "Final answer", ""),
+        ]
+        for content, answer, reasoning in cases:
+            with self.subTest(content=content):
+                result = {"choices": [{"message": {"content": content}}]}
+                self.assertEqual(self.nodes._response_parts(result), (answer, reasoning))
+
+    def test_response_keeps_separate_reasoning(self):
+        result = {"choices": [{"message": {"content": "Final", "reasoning_content": "Private"}}]}
+        self.assertEqual(self.nodes._response_parts(result), ("Final", "Private"))
+
+    def test_thinking_truncation_reports_missing_final_answer(self):
+        result = {"choices": [{"message": {"content": "<think>unfinished"}, "finish_reason": "length"}]}
+        with self.assertRaisesRegex(RuntimeError, "produced no final answer"):
+            self.nodes._response_parts(result)
+
     def test_inputs_and_preset_order(self):
         options = self.nodes.QwenGGUFInference.INPUT_TYPES()["required"]
         self.assertIn(str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), options["model"][0])

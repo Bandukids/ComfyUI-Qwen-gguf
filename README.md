@@ -13,7 +13,7 @@
 | 提示词 | 用户提示词、系统提示词，以及描述、OCR、视频总结等预设 |
 | 推理 | `auto`、`images`、`video`、`one by one` 四种模式 |
 | 调参 | 采样、思考预算、上下文、Flash Attention、GPU 层数、可选 MTP |
-| 输出 | `response`、`reasoning`、`stats_json` |
+| 输出 | `response` 仅含最终答案；`reasoning` 单独保留思考过程；`stats_json` 为统计信息 |
 
 Qwen3.5 使用 `Qwen35ChatHandler`，Qwen3.8 使用模型聊天模板驱动的 `GenericMTMDChatHandler`。其他后续模型是否兼容，取决于 GGUF、匹配的 mmproj 和所安装的 `llama-cpp-python` 构建；不支持早期 Qwen 模型。
 

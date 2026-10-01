@@ -6,6 +6,7 @@ import ctypes
 import gc
 import io
 import json
+import re
 from pathlib import Path
 import threading
 
@@ -304,16 +305,31 @@ def _response_parts(result):
     try:
         message = result["choices"][0]["message"]
         answer = message.get("content") or ""
-        reasoning = message.get("reasoning_content") or ""
+        reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
         if isinstance(answer, list):
             answer = "".join(part.get("text", "") for part in answer if isinstance(part, dict))
         if not isinstance(answer, str) or not isinstance(reasoning, str):
             raise ValueError("non-text response")
-        if "<think>" in answer and "</think>" in answer:
-            prefix, rest = answer.split("<think>", 1)
-            thought, suffix = rest.split("</think>", 1)
-            reasoning = reasoning or thought.strip()
-            answer = (prefix + suffix).strip()
+        # Qwen templates may put the opening tag in the prompt, so only the
+        # closing tag appears in generated content. Also hide unfinished blocks.
+        parts = re.split(r"(<\s*/?\s*think\s*>)", answer, flags=re.IGNORECASE)
+        if len(parts) > 1:
+            in_thought = bool(re.fullmatch(r"<\s*/\s*think\s*>", parts[1], re.IGNORECASE))
+            final_parts, thought_parts = [], []
+            for part in parts:
+                if re.fullmatch(r"<\s*think\s*>", part, re.IGNORECASE):
+                    in_thought = True
+                elif re.fullmatch(r"<\s*/\s*think\s*>", part, re.IGNORECASE):
+                    in_thought = False
+                else:
+                    (thought_parts if in_thought else final_parts).append(part)
+            reasoning = reasoning or "\n\n".join(p.strip() for p in thought_parts if p.strip())
+            answer = "".join(final_parts).strip()
+        if not answer.strip() and reasoning and result["choices"][0].get("finish_reason") == "length":
+            raise RuntimeError(
+                "The model reached max_tokens during thinking and produced no final answer. "
+                "Increase max_tokens or disable enable_thinking in Qwen GGUF Parameters."
+            )
         return answer, reasoning
     except (KeyError, IndexError, TypeError, ValueError) as error:
         raise RuntimeError(f"Unexpected llama-cpp-python response: {str(result)[:1000]}") from error
