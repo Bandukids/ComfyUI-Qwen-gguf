@@ -8,14 +8,14 @@
 
 | 功能 | 说明 |
 | --- | --- |
-| 模型 | 本地 GGUF 主模型；视觉输入需配套 `mmproj*.gguf` |
+| 模型 | 本地 GGUF 或四个可自动下载的 Unsloth Qwen3.8 27B 预设；视觉输入需配套 mmproj |
 | 输入 | 文本、单图、多图、图片形式的视频帧批次、原生 ComfyUI `VIDEO` |
 | 提示词 | 用户提示词、系统提示词，以及描述、OCR、视频总结等预设 |
 | 推理 | `auto`、`images`、`video`、`one by one` 四种模式 |
 | 调参 | 采样、思考预算、上下文、Flash Attention、GPU 层数、可选 MTP |
 | 输出 | `response`、`reasoning`、`stats_json` |
 
-本项目围绕可提供 `Qwen35ChatHandler` 的 GGUF 后端实现。后续 Qwen 模型是否兼容，取决于模型 GGUF、匹配的 mmproj 和所安装的 `llama-cpp-python` 构建；不支持早期 Qwen 模型。
+Qwen3.5 使用 `Qwen35ChatHandler`，Qwen3.8 使用模型聊天模板驱动的 `GenericMTMDChatHandler`。其他后续模型是否兼容，取决于 GGUF、匹配的 mmproj 和所安装的 `llama-cpp-python` 构建；不支持早期 Qwen 模型。
 
 ## 安装
 
@@ -42,24 +42,39 @@ ComfyUI/
 python -m pip install -r "custom_nodes/ComfyUI-Qwen-gguf/requirements.txt"
 ```
 
-Windows 便携版请把上面的 `python` 换成其自带的 `python.exe` 完整路径。`requirements.txt` 只安装 Pillow；PyTorch 由 ComfyUI 提供。
+Windows 便携版请把上面的 `python` 换成其自带的 `python.exe` 完整路径。`requirements.txt` 安装 Pillow 和 Hugging Face Hub 下载库；PyTorch 由 ComfyUI 提供。
 
 ### 3. 单独安装视觉版 `llama-cpp-python`
 
-节点需要包含 `Qwen35ChatHandler` 的构建。请从 [JamePeng/llama-cpp-python Releases](https://github.com/JamePeng/llama-cpp-python/releases) 下载与 **操作系统、Python 版本和 GPU 后端** 匹配的 wheel，再用同一个 ComfyUI Python 安装：
+节点需要包含 `Qwen35ChatHandler` 与 `GenericMTMDChatHandler` 的构建。请从 [JamePeng/llama-cpp-python Releases](https://github.com/JamePeng/llama-cpp-python/releases) 下载与 **操作系统、Python 版本和 GPU 后端** 匹配的 wheel，再用同一个 ComfyUI Python 安装：
 
 ```powershell
 python -m pip install "<下载的 wheel 文件路径>"
-python -c "from llama_cpp.llama_chat_format import Qwen35ChatHandler; print('Qwen35ChatHandler OK')"
+python -c "from llama_cpp.llama_chat_format import Qwen35ChatHandler; from llama_cpp.llama_multimodal import GenericMTMDChatHandler; print('Vision handlers OK')"
 ```
 
 已用该项目的 `0.3.49` 构建验证 Qwen 3.5 视觉推理和 CUDA 后端。已有可用的 CUDA wheel 时，无需重新安装；也不要仅为满足依赖而用普通 `pip install llama-cpp-python` 覆盖它。该 wheel 的选择方法见[上游安装说明](https://github.com/JamePeng/llama-cpp-python#installation)；另可参考 [ComfyUI-QwenVL 的视觉版安装指南](https://github.com/1038lab/ComfyUI-QwenVL/blob/main/docs/LLAMA_CPP_PYTHON_VISION_INSTALL.md)。
 
 完成后重启 ComfyUI，并在节点菜单的 **Qwen/GGUF** 分类中找到两个节点。
 
+## Qwen3.8 自动下载预设
+
+在推理节点的 `model` 下拉框选择以 `Download | Unsloth Qwen3.8` 开头的选项，**第一次执行时**才会下载。四个预设均来自 [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/main)：
+
+| 预设量化 | 主模型下载量 | 说明 |
+| --- | ---: | --- |
+| `IQ2_S` | 8.37 GB | 占用较低，适合先试用 |
+| `IQ3_XXS` | 10.93 GB | 中等体积 |
+| `IQ3_S` | 12.04 GB | 更高的量化精度 |
+| `Q3_K_XL` | 13.15 GB | 四项中体积最大 |
+
+节点同时下载同一仓库的 `mmproj-F16.gguf`（0.93 GB），以便直接使用视觉推理和思考开关；`mmproj` 下拉框的选择会被预设自动匹配覆盖。文件保存到 `ComfyUI/models/LLM/unsloth/Qwen3.8-27B-GGUF/`；已有完整文件会直接复用，下载中断后再次执行可继续。预设固定在仓库提交 `4ca7207`，使主模型与 mmproj 版本一致。
+
+这些是下载大小，不是推理所需显存。还需为 mmproj、上下文缓存和 ComfyUI 其他节点留出空间；显存不足时请选更小量化或减少 `gpu_layers`。下载进度显示在 ComfyUI 控制台。未选择下载预设时不会访问 Hugging Face，本地 GGUF 用法保持不变。
+
 ## 快速使用
 
-1. 添加 **Qwen 3.5+ GGUF Inference**，选择 `model`；有图像或视频时还要选择匹配的 `mmproj`。
+1. 添加 **Qwen 3.5+ GGUF Inference**，选择本地 `model` 或下载预设；本地模型有图像或视频输入时还要选择匹配的 `mmproj`。
 2. 填写 `user_prompt`，按需修改 `preset_prompt` 与 `system_prompt`。预设内容会放在用户提示词之前；`Empty - Nothing` 不追加预设。
 3. 按输入类型连线。需要更多选项时，添加 **Qwen GGUF Parameters** 并连接到 `parameters`。
 
@@ -111,6 +126,8 @@ python -c "from llama_cpp.llama_chat_format import Qwen35ChatHandler; print('Qwe
 ## 常见问题
 
 **找不到 `Qwen35ChatHandler`**：确认安装的是带该处理器的 wheel，且安装命令使用的是 ComfyUI 自己的 Python；可运行上面的导入检查。
+
+**自动下载失败**：检查 Hugging Face 网络连接和磁盘剩余空间，然后重新执行节点。已完成的文件会复用；未完成的下载由 Hugging Face Hub 继续处理。也可以在仓库页面手动下载相同文件并放入上述目录。
 
 **GPU 利用率低、CPU 很忙**：检查 wheel 是否包含对应 GPU 后端，确认 `gpu_layers` 大于 0。`stats_json` 中该参数为 0 时，节点没有请求模型层 GPU 卸载。模型超过可用显存时，可换更小的 GGUF、降低上下文或释放其他显存占用。
 

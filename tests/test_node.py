@@ -141,6 +141,9 @@ class QwenNodeTests(unittest.TestCase):
     def test_inputs_and_preset_order(self):
         options = self.nodes.QwenGGUFInference.INPUT_TYPES()["required"]
         self.assertIn(str(Path("Qwen-VL") / "Qwen3.5-Q4.gguf"), options["model"][0])
+        self.assertEqual(len(self.nodes.DOWNLOAD_PRESETS), 4)
+        self.assertTrue(all(preset in options["model"][0]
+                            for preset in self.nodes.DOWNLOAD_PRESETS))
         self.assertIn(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"), options["mmproj"][0])
         self.assertLess(list(options).index("user_prompt"), list(options).index("system_prompt"))
         self.assertEqual(options["attention_mode"][0], ["auto", "on", "off"])
@@ -264,6 +267,71 @@ class QwenNodeTests(unittest.TestCase):
     def test_invalid_path_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Invalid GGUF"):
             self.nodes._model_path("../outside.gguf")
+
+    def test_download_preset_reuses_complete_model_and_projector(self):
+        preset, filename = next(iter(self.nodes.DOWNLOAD_PRESETS.items()))
+        projector = self.nodes.HF_MMPROJ
+        previous_dir = self.nodes.HF_MODEL_DIR
+        previous_sizes = dict(self.nodes.HF_FILE_SIZES)
+        previous_hub = sys.modules.get("huggingface_hub")
+        calls = []
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                self.nodes.HF_MODEL_DIR = Path(directory)
+                self.nodes.HF_FILE_SIZES[filename] = 8
+                self.nodes.HF_FILE_SIZES[projector] = 8
+                hub = types.ModuleType("huggingface_hub")
+
+                def download(**kwargs):
+                    calls.append(kwargs)
+                    path = Path(kwargs["local_dir"]) / kwargs["filename"]
+                    path.write_bytes(b"GGUFtest")
+                    return str(path)
+
+                hub.hf_hub_download = download
+                sys.modules["huggingface_hub"] = hub
+                model_path, mmproj_path = self.nodes._download_preset(preset)
+                self.assertEqual(Path(model_path).name, filename)
+                self.assertEqual(Path(mmproj_path).name, projector)
+                self.assertEqual(len(calls), 2)
+                self.assertTrue(all(call["repo_id"] == self.nodes.HF_REPO_ID and
+                                    call["revision"] == self.nodes.HF_REVISION for call in calls))
+                self.nodes._download_preset(preset)
+                self.assertEqual(len(calls), 2)
+        finally:
+            self.nodes.HF_MODEL_DIR = previous_dir
+            self.nodes.HF_FILE_SIZES.clear()
+            self.nodes.HF_FILE_SIZES.update(previous_sizes)
+            if previous_hub is None:
+                sys.modules.pop("huggingface_hub", None)
+            else:
+                sys.modules["huggingface_hub"] = previous_hub
+
+    def test_download_preset_uses_generic_qwen38_handler(self):
+        original = self.nodes._download_preset
+        captured = []
+        try:
+            def fake_download(choice):
+                captured.append(choice)
+                return ("Qwen3.8-27B-UD-IQ2_S.gguf", "mmproj-F16.gguf")
+
+            self.nodes._download_preset = fake_download
+            preset = next(iter(self.nodes.DOWNLOAD_PRESETS))
+            image = FakeTensor(np.zeros((1, 2, 2, 3), dtype=np.float32))
+            params = self.parameter_options()
+            params["enable_thinking"] = True
+            self.nodes.QwenGGUFInference().infer(
+                model=preset, mmproj="None", user_prompt="describe", system_prompt="system",
+                image=image, parameters=params,
+            )
+            self.assertEqual(captured, [preset])
+            kwargs = FakeLlama.instances[0].kwargs
+            self.assertEqual(kwargs["mmproj_path"], "mmproj-F16.gguf")
+            self.assertIsNone(kwargs["chat_handler"])
+            self.assertTrue(kwargs["chat_handler_kwargs"]["extra_template_arguments"]["enable_thinking"])
+            self.assertEqual(len(FakeHandler.instances), 0)
+        finally:
+            self.nodes._download_preset = original
 
     def test_connected_parameters_are_forwarded(self):
         params = self.parameter_options()

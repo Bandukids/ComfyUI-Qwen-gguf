@@ -18,8 +18,29 @@ MODEL_DIR = Path(folder_paths.models_dir) / "LLM"
 folder_paths.add_model_folder_path(MODEL_CATEGORY, str(MODEL_DIR))
 
 _LOCK = threading.RLock()
+_DOWNLOAD_LOCK = threading.RLock()
 _MODEL = None
 _CONFIG = None
+
+# Pinned together so the language model and vision projector come from the same
+# upstream snapshot. Sizes are exact bytes reported by the Hugging Face Hub.
+HF_REPO_ID = "unsloth/Qwen3.8-27B-GGUF"
+HF_REVISION = "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+HF_MODEL_DIR = MODEL_DIR / "unsloth" / "Qwen3.8-27B-GGUF"
+HF_MMPROJ = "mmproj-F16.gguf"
+HF_FILE_SIZES = {
+    "Qwen3.8-27B-UD-IQ2_S.gguf": 8371970048,
+    "Qwen3.8-27B-UD-IQ3_XXS.gguf": 10934860704,
+    "Qwen3.8-27B-UD-IQ3_S.gguf": 12040883104,
+    "Qwen3.8-27B-UD-Q3_K_XL.gguf": 13146393504,
+    HF_MMPROJ: 927607488,
+}
+DOWNLOAD_PRESETS = {
+    "Download | Unsloth Qwen3.8 27B IQ2_S (8.37 GB)": "Qwen3.8-27B-UD-IQ2_S.gguf",
+    "Download | Unsloth Qwen3.8 27B IQ3_XXS (10.93 GB)": "Qwen3.8-27B-UD-IQ3_XXS.gguf",
+    "Download | Unsloth Qwen3.8 27B IQ3_S (12.04 GB)": "Qwen3.8-27B-UD-IQ3_S.gguf",
+    "Download | Unsloth Qwen3.8 27B Q3_K_XL (13.15 GB)": "Qwen3.8-27B-UD-Q3_K_XL.gguf",
+}
 
 PROMPT_PRESETS = {
     "Empty - Nothing": "",
@@ -72,6 +93,54 @@ def _model_path(name):
     return str(Path(full_path).resolve())
 
 
+def _valid_remote_gguf(path, expected_size):
+    if not path.is_file() or path.stat().st_size != expected_size:
+        return False
+    with path.open("rb") as file:
+        return file.read(4) == b"GGUF"
+
+
+def _download_remote_file(filename):
+    """Reuse a complete local file or let huggingface_hub resume its download."""
+    expected_size = HF_FILE_SIZES[filename]
+    target = HF_MODEL_DIR / filename
+    if _valid_remote_gguf(target, expected_size):
+        return str(target.resolve())
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as error:
+        raise RuntimeError("Automatic model downloads require huggingface-hub. Install requirements.txt.") from error
+
+    HF_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"[Qwen GGUF] Downloading {HF_REPO_ID}/{filename} to {HF_MODEL_DIR}")
+    try:
+        downloaded = Path(hf_hub_download(
+            repo_id=HF_REPO_ID, filename=filename, revision=HF_REVISION,
+            local_dir=str(HF_MODEL_DIR),
+        ))
+        if not _valid_remote_gguf(downloaded, expected_size):
+            # A stale local-dir cache can report a damaged file as complete.
+            downloaded = Path(hf_hub_download(
+                repo_id=HF_REPO_ID, filename=filename, revision=HF_REVISION,
+                local_dir=str(HF_MODEL_DIR), force_download=True,
+            ))
+        if not _valid_remote_gguf(downloaded, expected_size):
+            raise RuntimeError(f"Downloaded file is incomplete or invalid: {downloaded}")
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not download {filename} from https://huggingface.co/{HF_REPO_ID}. "
+            f"Check network access and free disk space, then retry; interrupted downloads can resume."
+        ) from error
+    return str(downloaded.resolve())
+
+
+def _download_preset(choice):
+    with _DOWNLOAD_LOCK:
+        model_path = _download_remote_file(DOWNLOAD_PRESETS[choice])
+        mmproj_path = _download_remote_file(HF_MMPROJ)
+    return model_path, mmproj_path
+
+
 def _close_model():
     global _MODEL, _CONFIG
     model, _MODEL, _CONFIG = _MODEL, None, None
@@ -108,13 +177,12 @@ def _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_m
     global _MODEL, _CONFIG
     try:
         import llama_cpp
-        from llama_cpp.llama_chat_format import Qwen35ChatHandler
     except ImportError as error:
         raise RuntimeError(
-            "This node requires a vision-capable llama-cpp-python with Qwen35ChatHandler. "
-            "Install it in ComfyUI's Python environment."
+            "This node requires a vision-capable llama-cpp-python. Install it in ComfyUI's Python environment."
         ) from error
 
+    use_generic_handler = "qwen3.8" in Path(model_path).name.lower()
     gpu_available = _gpu_offload_available(llama_cpp) if gpu_layers else False
     effective_gpu_layers = gpu_layers if gpu_available else 0
     if attention_mode not in ATTENTION_MODES:
@@ -123,7 +191,7 @@ def _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_m
         raise ValueError("n_ubatch cannot exceed n_batch.")
     config = (model_path, mmproj_path, context_size, effective_gpu_layers, attention_mode,
               n_batch, n_ubatch, n_threads, image_max_tokens, enable_thinking,
-              mtp_draft_tokens, mtp_draft_p_min)
+              mtp_draft_tokens, mtp_draft_p_min, use_generic_handler)
     if _MODEL is not None and _CONFIG == config:
         return _MODEL
 
@@ -133,7 +201,11 @@ def _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_m
 
     handler = None
     try:
-        if mmproj_path is not None:
+        if mmproj_path is not None and not use_generic_handler:
+            try:
+                from llama_cpp.llama_chat_format import Qwen35ChatHandler
+            except ImportError as error:
+                raise RuntimeError("This model requires a llama-cpp-python build with Qwen35ChatHandler.") from error
             handler = Qwen35ChatHandler(
                 mmproj_path=mmproj_path, use_gpu=gpu_available,
                 enable_thinking=enable_thinking, image_max_tokens=image_max_tokens,
@@ -150,13 +222,21 @@ def _ensure_model(model_path, mmproj_path, context_size, gpu_layers, attention_m
                 draft_n_max=mtp_draft_tokens,
                 draft_p_min=mtp_draft_p_min,
             )
-        model = llama_cpp.Llama(
+        model_options = dict(
             model_path=model_path, n_ctx=context_size,
             n_gpu_layers=effective_gpu_layers, n_batch=n_batch, n_ubatch=n_ubatch,
             n_threads=n_threads or None, speculative=speculative,
             swa_full=True, chat_handler=handler, verbose=False,
             flash_attn_type=ATTENTION_MODES[attention_mode],
         )
+        if use_generic_handler and mmproj_path is not None:
+            model_options["mmproj_path"] = mmproj_path
+            model_options["chat_handler_kwargs"] = {
+                "use_gpu": gpu_available, "image_max_tokens": image_max_tokens,
+                "extra_template_arguments": {"enable_thinking": enable_thinking},
+                "verbose": False,
+            }
+        model = llama_cpp.Llama(**model_options)
     except Exception as error:
         if handler is not None:
             handler.close()
@@ -304,9 +384,10 @@ class QwenGGUFInference:
         files = _gguf_files()
         models = [name for name in files if "mmproj" not in Path(name).name.lower()]
         projectors = [name for name in files if "mmproj" in Path(name).name.lower()]
+        model_choices = (models or ["Select a local model or download preset"]) + list(DOWNLOAD_PRESETS)
         return {
             "required": {
-                "model": (models or ["No GGUF model found"],),
+                "model": (model_choices,),
                 "mmproj": (["None"] + projectors,),
                 "preset_prompt": (list(PROMPT_PRESETS), {"default": "Normal - Describe"}),
                 "user_prompt": ("STRING", {"multiline": True, "default": "Describe this image."}),
@@ -358,8 +439,11 @@ class QwenGGUFInference:
         selected_count = len(selected) if selected is not None else 0
         is_video_sequence = video is not None or frame_rate is not None or params["inference_mode"] == "video"
         mode = _mode(selected_count, params, context_size, is_video_sequence)
-        model_path = _model_path(model)
-        mmproj_path = None if mmproj == "None" else _model_path(mmproj)
+        if model in DOWNLOAD_PRESETS:
+            model_path, mmproj_path = _download_preset(model)
+        else:
+            model_path = _model_path(model)
+            mmproj_path = None if mmproj == "None" else _model_path(mmproj)
         if media is not None and mmproj_path is None:
             raise ValueError("IMAGE input requires the matching mmproj GGUF file.")
         if params["enable_thinking"] and mmproj_path is None:
