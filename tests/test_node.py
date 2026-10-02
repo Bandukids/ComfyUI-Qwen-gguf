@@ -175,6 +175,7 @@ class QwenNodeTests(unittest.TestCase):
         self.assertIn("video", self.nodes.QwenGGUFInference.INPUT_TYPES()["optional"])
         self.assertEqual(self.nodes.QwenGGUFInference.INPUT_TYPES()["optional"]["video"], ("VIDEO",))
         self.assertTrue(options["seed"][1]["control_after_generate"])
+        self.assertFalse(options["enable_thinking"][1]["default"])
         param_names = list(self.nodes.QwenGGUFParameters.INPUT_TYPES()["required"])
         self.assertEqual(param_names[:2], ["enable_thinking", "reasoning_budget"])
         self.assertEqual(self.nodes.QwenGGUFParameters.INPUT_TYPES()["required"]["inference_mode"][0],
@@ -384,6 +385,21 @@ class QwenNodeTests(unittest.TestCase):
             self.assertEqual(request[name], value)
         self.assertEqual([part["text"] for part in request["messages"][-1]["content"]
                           if part["type"] == "text"][1:], ["Image 1:", "Image 4:"])
+
+    def test_main_thinking_switch_overrides_parameters_and_reloads(self):
+        options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
+        params = self.parameter_options()
+        params.update(enable_thinking=True, reasoning_budget=80)
+        node = self.nodes.QwenGGUFInference()
+        node.infer(**options, parameters=params, enable_thinking=False)
+        self.assertFalse(FakeHandler.instances[-1].kwargs["enable_thinking"])
+        self.assertEqual(FakeLlama.calls[-1]["reasoning_budget"], -1)
+        first = FakeLlama.instances[-1]
+        params["enable_thinking"] = False
+        node.infer(**options, parameters=params, enable_thinking=True)
+        self.assertTrue(first.closed)
+        self.assertTrue(FakeHandler.instances[-1].kwargs["enable_thinking"])
+        self.assertEqual(FakeLlama.calls[-1]["reasoning_budget"], 80)
 
     def test_mtp_uses_speculative_config_and_reloads(self):
         options = self.base_options()

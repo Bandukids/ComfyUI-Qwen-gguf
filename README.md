@@ -112,7 +112,7 @@ python -c "from llama_cpp.llama_chat_format import Qwen35ChatHandler; from llama
 
 | 参数 | 作用 |
 | --- | --- |
-| `enable_thinking`、`reasoning_budget` | 启用思考模板并设置预算；预算 `-1` 不限制。当前处理器开启思考时需要 mmproj |
+| `enable_thinking`、`reasoning_budget` | 主推理节点的 `enable_thinking` 默认关闭，优先于 Parameters 中保留的兼容选项；Parameters 的 `reasoning_budget` 设置预算，`-1` 不限制。开启思考时需要 mmproj |
 | `max_tokens`、`temperature`、`top_k`、`top_p`、`min_p`、`typical_p` | 输出长度和采样策略 |
 | `repeat_penalty`、`frequency_penalty`、`presence_penalty` | 重复与话题惩罚 |
 | `mirostat_mode`、`mirostat_eta`、`mirostat_tau` | 自适应采样；模式 0 关闭 |

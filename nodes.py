@@ -328,7 +328,7 @@ def _response_parts(result):
         if not answer.strip() and reasoning and result["choices"][0].get("finish_reason") == "length":
             raise RuntimeError(
                 "The model reached max_tokens during thinking and produced no final answer. "
-                "Increase max_tokens or disable enable_thinking in Qwen GGUF Parameters."
+                "Increase max_tokens or disable enable_thinking on the inference node."
             )
         return answer, reasoning
     except (KeyError, IndexError, TypeError, ValueError) as error:
@@ -413,6 +413,8 @@ class QwenGGUFInference:
                 "gpu_layers": ("INT", {"default": 99, "min": 0, "max": 999}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffff, "control_after_generate": True}),
+                "enable_thinking": ("BOOLEAN", {"default": False,
+                    "tooltip": "Enable model thinking. This main-node switch overrides the Parameters setting."}),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -428,7 +430,8 @@ class QwenGGUFInference:
 
     def infer(self, model, mmproj, user_prompt, system_prompt, preset_prompt="Normal - Describe",
               attention_mode="auto", context_size=8192, gpu_layers=99,
-              keep_model_loaded=True, seed=0, image=None, video=None, parameters=None):
+              keep_model_loaded=True, seed=0, image=None, video=None, parameters=None,
+              enable_thinking=None):
         if parameters is not None and not isinstance(parameters, dict):
             raise TypeError("parameters must come from a Qwen GGUF Parameters node.")
         params = dict(PARAMETER_DEFAULTS)
@@ -437,6 +440,10 @@ class QwenGGUFInference:
             if unknown:
                 raise ValueError(f"Unknown inference parameters: {sorted(unknown)}")
             params.update(parameters)
+        # Keep the old Parameters field compatible; the visible main-node
+        # switch takes precedence whenever supplied by ComfyUI.
+        if enable_thinking is not None:
+            params["enable_thinking"] = bool(enable_thinking)
         if image is not None and video is not None:
             raise ValueError("Connect either image or video input, not both.")
         if params["max_frames"] < 1 or params["max_size"] < 0 or params["video_fps"] < 0:
