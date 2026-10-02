@@ -3,6 +3,7 @@
 import base64
 import importlib.util
 import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -50,6 +51,9 @@ class FakeTensor:
 class FakeLlama:
     instances = []
     calls = []
+    raw_calls = []
+    prompt_length = 24
+    resets = 0
     response = {"choices": [{"message": {"content": "two images"}}],
                 "usage": {"completion_tokens": 3}}
 
@@ -63,7 +67,24 @@ class FakeLlama:
         self.completion_kwargs = kwargs
         self.messages = kwargs["messages"]
         self.calls.append(kwargs)
+        return self.create_completion(prompt=[0] * self.prompt_length,
+                                      **{k: v for k, v in kwargs.items() if k != "messages"})
+
+    def create_completion(self, **kwargs):
+        self.raw_calls.append(kwargs)
         return self.response
+
+    def n_ctx(self):
+        return self.kwargs["n_ctx"]
+
+    def reset(self):
+        self.resets += 1
+
+    def detokenize(self, tokens, **kwargs):
+        handler = self.kwargs.get("chat_handler")
+        thinking = (handler.kwargs["enable_thinking"] if handler else
+                    self.kwargs.get("chat_handler_kwargs", {}).get("extra_template_arguments", {}).get("enable_thinking"))
+        return b"assistant\n<think>\n" if thinking else b"assistant\n<think>\n</think>\n"
 
     def close(self):
         self.closed = True
@@ -134,6 +155,9 @@ class QwenNodeTests(unittest.TestCase):
         self.nodes._close_model()
         FakeLlama.instances.clear()
         FakeLlama.calls.clear()
+        FakeLlama.raw_calls.clear()
+        FakeLlama.prompt_length = 24
+        FakeLlama.resets = 0
         FakeHandler.instances.clear()
         FakeLlama.response = {"choices": [{"message": {"content": "two images"}}],
                               "usage": {"completion_tokens": 3}}
@@ -176,6 +200,7 @@ class QwenNodeTests(unittest.TestCase):
         self.assertEqual(self.nodes.QwenGGUFInference.INPUT_TYPES()["optional"]["video"], ("VIDEO",))
         self.assertTrue(options["seed"][1]["control_after_generate"])
         self.assertFalse(options["enable_thinking"][1]["default"])
+        self.assertEqual(options["thinking_level"][0], ["auto", "low", "medium", "high", "custom"])
         param_names = list(self.nodes.QwenGGUFParameters.INPUT_TYPES()["required"])
         self.assertEqual(param_names[:2], ["enable_thinking", "reasoning_budget"])
         self.assertEqual(self.nodes.QwenGGUFParameters.INPUT_TYPES()["required"]["inference_mode"][0],
@@ -393,13 +418,76 @@ class QwenNodeTests(unittest.TestCase):
         node = self.nodes.QwenGGUFInference()
         node.infer(**options, parameters=params, enable_thinking=False)
         self.assertFalse(FakeHandler.instances[-1].kwargs["enable_thinking"])
-        self.assertEqual(FakeLlama.calls[-1]["reasoning_budget"], -1)
+        self.assertEqual(FakeLlama.calls[-1]["reasoning_budget"], 0)
         first = FakeLlama.instances[-1]
         params["enable_thinking"] = False
         node.infer(**options, parameters=params, enable_thinking=True)
         self.assertTrue(first.closed)
         self.assertTrue(FakeHandler.instances[-1].kwargs["enable_thinking"])
         self.assertEqual(FakeLlama.calls[-1]["reasoning_budget"], 80)
+
+    def test_thinking_levels_reserve_final_answer_and_reuse_model(self):
+        options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
+        node = self.nodes.QwenGGUFInference()
+        for level, budget in (("auto", 512), ("low", 256), ("medium", 1024), ("high", 4096)):
+            with self.subTest(level=level):
+                _, _, stats = node.infer(**options, enable_thinking=True, thinking_level=level)
+                call = FakeLlama.raw_calls[-1]
+                self.assertEqual(call["reasoning_budget"], budget)
+                self.assertEqual(call["max_tokens"], 1024 + budget + 64)
+                self.assertTrue(call["reasoning_start_in_prompt"])
+                self.assertIn("final answer", call["reasoning_budget_message"])
+                self.assertEqual(json.loads(stats)["thinking"]["calls"][-1]["reasoning_budget"], budget)
+        self.assertEqual(len(FakeLlama.instances), 1)
+        self.assertNotIn("create_completion", vars(FakeLlama.instances[0]))
+
+    def test_thinking_budget_shrinks_for_actual_prompt_size(self):
+        options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
+        FakeLlama.prompt_length = 6800
+        _, _, stats = self.nodes.QwenGGUFInference().infer(
+            **options, enable_thinking=True, thinking_level="high")
+        call = FakeLlama.raw_calls[-1]
+        self.assertEqual(call["reasoning_budget"], 304)
+        self.assertEqual(call["max_tokens"], 1392)
+        self.assertEqual(json.loads(stats)["thinking"]["calls"][-1]["prompt_tokens"], 6800)
+
+    def test_per_frame_thinking_is_bounded_separately(self):
+        options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
+        params = self.parameter_options()
+        params["inference_mode"] = "one by one"
+        self.nodes.QwenGGUFInference().infer(
+            **options, image=FakeTensor(np.zeros((2, 2, 2, 3), dtype=np.float32)),
+            parameters=params, enable_thinking=True, thinking_level="high")
+        self.assertEqual([call["reasoning_budget"] for call in FakeLlama.raw_calls], [64, 64, 4096])
+        self.assertEqual([call["max_tokens"] for call in FakeLlama.raw_calls], [384, 384, 5184])
+
+    def test_custom_zero_disables_thinking_and_ignores_budget_when_off(self):
+        options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
+        params = self.parameter_options()
+        params["reasoning_budget"] = 0
+        node = self.nodes.QwenGGUFInference()
+        node.infer(**options, parameters=params, enable_thinking=True, thinking_level="custom")
+        self.assertFalse(FakeHandler.instances[-1].kwargs["enable_thinking"])
+        node.infer(**options, enable_thinking=False, thinking_level="high")
+        self.assertEqual(FakeLlama.raw_calls[-1]["reasoning_budget"], 0)
+        self.assertEqual(FakeLlama.raw_calls[-1]["max_tokens"], 1024)
+
+    def test_context_overflow_restores_completion_adapter(self):
+        options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
+        FakeLlama.prompt_length = 8192
+        with self.assertRaisesRegex(ValueError, "Input fills the context"):
+            self.nodes.QwenGGUFInference().infer(
+                **options, enable_thinking=True, thinking_level="high")
+        self.assertNotIn("create_completion", vars(FakeLlama.instances[-1]))
+
+    def test_prefilled_thinking_truncation_does_not_leak_to_response(self):
+        options = self.base_options(str(Path("Qwen-VL") / "mmproj-Qwen3.5.gguf"))
+        FakeLlama.response = {"choices": [{"message": {"content": "unfinished thoughts"}, "finish_reason": "length"}]}
+        with self.assertRaisesRegex(RuntimeError, "produced no final answer"):
+            self.nodes.QwenGGUFInference().infer(
+                **options, enable_thinking=True, thinking_level="custom")
+        self.assertNotIn("create_completion", vars(FakeLlama.instances[-1]))
+        self.assertEqual(FakeLlama.instances[-1].resets, 1)
 
     def test_mtp_uses_speculative_config_and_reloads(self):
         options = self.base_options()

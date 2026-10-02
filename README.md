@@ -12,7 +12,7 @@
 | 输入 | 文本、单图、多图、图片形式的视频帧批次、原生 ComfyUI `VIDEO` |
 | 提示词 | 用户提示词、系统提示词，以及描述、OCR、视频总结等预设 |
 | 推理 | `auto`、`images`、`video`、`one by one` 四种模式 |
-| 调参 | 采样、思考预算、上下文、Flash Attention、GPU 层数、可选 MTP |
+| 调参 | 主节点思考开关与强度、采样、思考预算、上下文、Flash Attention、GPU 层数、可选 MTP |
 | 输出 | `response` 仅含最终答案；`reasoning` 单独保留思考过程；`stats_json` 为统计信息 |
 
 Qwen3.5 使用 `Qwen35ChatHandler`，Qwen3.8 使用模型聊天模板驱动的 `GenericMTMDChatHandler`。其他后续模型是否兼容，取决于 GGUF、匹配的 mmproj 和所安装的 `llama-cpp-python` 构建；不支持早期 Qwen 模型。
@@ -122,6 +122,32 @@ python -c "from llama_cpp.llama_chat_format import Qwen35ChatHandler; from llama
 | `mtp_draft_tokens`、`mtp_draft_p_min` | MTP 推测解码；草稿 token 数 0 关闭，需兼容的模型及后端 |
 
 `stats_json` 返回 token 用量、所选模式、总帧数、抽样帧数、模型调用次数，以及可用的 MTP 统计。`gpu_layers_effective` 表示节点传给后端的 GPU 层数参数，并不是显存占用量或实际卸载层数的独立测量。
+
+## 思考强度
+
+主推理节点的 `enable_thinking` 是总开关，默认关闭。开启后，`thinking_level` 控制允许生成的思考 token 数：
+
+| 选项 | 思考预算 | 使用方式 |
+| --- | ---: | --- |
+| `auto`（默认） | `max_tokens` 的一半，限制在 128–1024 | 日常描述与分析；默认 `max_tokens=1024` 时预算为 512 |
+| `low` | 256 | 更快的简短分析 |
+| `medium` | 1024 | 多图比较、细节分析 |
+| `high` | 4096 | 给复杂任务更多推理时间 |
+| `custom` | Parameters 的 `reasoning_budget` | 手动调试；`0` 关闭思考，`-1` 不限制思考预算 |
+
+这些档位是本节点的预算预设，作用是分配推理时间；更高强度不保证每次回答都更准确。关闭总开关时，强度选项不生效。旧工作流未传入 `thinking_level` 时继续使用原来的 Parameters 预算。
+
+预算通过 [llama-cpp-python 的预算采样器](https://github.com/JamePeng/llama-cpp-python/blob/main/llama_cpp/_internals.py) 执行。节点检查实际渲染的提示词：模板已打开 `<think>` 时，从第一个生成 token 开始计数；预算耗尽后插入简短的结论引导，强制结束第一段思考，再继续生成最终答案。收尾引导可能计入 `reasoning` 的文本/token 数，包含在额外的 64 token 余量内。关闭思考时同时关闭模板开关，并使用零预算拦截再次生成的思考标签。采样温度等设置仍由 Parameters 控制。
+
+有限预算下，节点把 `max_tokens` 作为为最终答案预留的生成空间，总生成上限增加思考预算和 64 个 token 的收尾余量。例如默认答案空间 1024 + `low` 的 256 + 64 = 总上限 1344。模型提前结束思考时，答案可以使用未用完的空间，因此这不是最终答案长度的独立硬上限。节点在图片/视频预填完成后按实际上下文余量缩减思考预算，优先给答案留空间；输入接近占满上下文时仍需增大 `context_size` 或减少帧数/图片尺寸。
+
+`one by one` 的单帧观察最多思考 64 个 token，最终汇总才使用所选强度，避免高档对每一帧重复长时间推理。`custom` 的 `-1` 保留无限思考预算的原有行为，但总输出仍受 `max_tokens` 限制，可能在生成答案前耗尽；一般建议先试 `auto` 或 `medium`。
+
+`stats_json.thinking` 记录开关、档位、请求预算，以及每次调用实际使用的预算、输入 token 数、生成上限和模板预填状态，方便比较速度与效果。`response` 仍只输出最终答案，`reasoning` 单独保留思考文本。
+
+修改强度无需重新加载模型权重。每次独立调用会清理推理上下文，避免当前 Qwen 混合架构后端在重复提示词时复用失效的采样位置；模型权重仍由 `keep_model_loaded` 控制是否保留。
+
+已在本机 Qwen3.5 9B GGUF + CUDA 下验证低/中档预算、图片输入的自定义预算与关闭思考；自动档、高档、上下文缩减与逐帧预算通过单元测试验证。这些检查验证预算控制和输出分离，不代表所有模型或任务的回答质量评测。
 
 ## 常见问题
 

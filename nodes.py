@@ -23,6 +23,10 @@ _DOWNLOAD_LOCK = threading.RLock()
 _MODEL = None
 _CONFIG = None
 
+THINKING_LEVELS = {"auto": None, "low": 256, "medium": 1024, "high": 4096, "custom": None}
+_THINKING_OVERHEAD = 64
+_THINKING_CONCLUSION = "\nI have reached my reasoning budget. I will now give the final answer directly and concisely.\n"
+
 # Pinned together so the language model and vision projector come from the same
 # upstream snapshot. Sizes are exact bytes reported by the Hugging Face Hub.
 HF_REPO_ID = "unsloth/Qwen3.8-27B-GGUF"
@@ -354,6 +358,87 @@ def _prompt_with_preset(preset_prompt, user_prompt):
     return "\n\n".join(part for part in (preset, user_prompt.strip()) if part)
 
 
+def _thinking_budget(level, params):
+    if level not in THINKING_LEVELS:
+        raise ValueError(f"Unknown thinking level: {level!r}")
+    if not params["enable_thinking"]:
+        return 0
+    if level == "custom":
+        budget = params["reasoning_budget"]
+        if not isinstance(budget, int) or budget < -1:
+            raise ValueError("reasoning_budget must be -1, 0, or a positive integer.")
+        return budget
+    if level == "auto":
+        return min(1024, max(128, params["max_tokens"] // 2))
+    return THINKING_LEVELS[level]
+
+
+def _complete(llm, messages, options, answer_tokens, budget, thinking, call_stats, stage):
+    """Apply the budget after MTMD has counted the actual text/media prompt.
+
+    The caller holds _LOCK. The temporary adapter is restored even on errors.
+    This keeps final-answer space available when the backend clamps generation
+    to the context window, and detects templates that already opened <think>.
+    """
+    original = llm.create_completion
+    had_override = "create_completion" in vars(llm)
+
+    def bounded_completion(*args, **kwargs):
+        prompt = kwargs.get("prompt", args[0] if args else None)
+        if isinstance(prompt, str):
+            tokens = llm.tokenize(prompt.encode("utf-8"), add_bos=True, special=True)
+        else:
+            tokens = list(prompt)
+        available = llm.n_ctx() - len(tokens)
+        if available <= 0:
+            raise ValueError("Input fills the context window. Increase context_size or reduce max_frames/max_size.")
+        effective_budget = budget
+        if thinking and budget >= 0:
+            if available <= _THINKING_OVERHEAD:
+                raise ValueError("No room for thinking and a final answer. Increase context_size or reduce the input.")
+            effective_budget = min(budget, max(0, available - answer_tokens - _THINKING_OVERHEAD))
+            limit = min(available, answer_tokens + effective_budget + _THINKING_OVERHEAD)
+        else:
+            # Custom -1 keeps the legacy unrestricted budget within max_tokens.
+            limit = min(available, answer_tokens)
+        # Only text tokens are detokenized; MTMD uses negative IDs for media.
+        tail = llm.detokenize([t for t in tokens[-128:] if t >= 0], special=True).decode("utf-8", errors="replace")
+        start_in_prompt = tail.rfind("<think>") > tail.rfind("</think>")
+        kwargs.update(max_tokens=limit, reasoning_budget=effective_budget,
+                      reasoning_start_in_prompt=start_in_prompt,
+                      reasoning_start="<think>", reasoning_end="</think>",
+                      reasoning_budget_message=_THINKING_CONCLUSION if thinking and effective_budget >= 0 else None)
+        call_stats.append({"stage": stage, "prompt_tokens": len(tokens),
+                           "reasoning_budget": effective_budget, "max_tokens": limit,
+                           "reasoning_start_in_prompt": start_in_prompt})
+        return original(*args, **kwargs)
+
+    llm.create_completion = bounded_completion
+    try:
+        # Requests in this node are stateless. The installed Qwen hybrid backend
+        # can reuse a prompt checkpoint with a stale last-decode cursor; reset
+        # context for every independent call, retaining the loaded weights.
+        llm.reset()
+        planned_limit = answer_tokens + budget + _THINKING_OVERHEAD if thinking and budget >= 0 else answer_tokens
+        result = llm.create_chat_completion(messages=messages, max_tokens=planned_limit,
+                                            reasoning_budget=budget, **options)
+        choice = result["choices"][0]
+        content = choice["message"].get("content")
+        if (thinking and call_stats[-1]["reasoning_start_in_prompt"] and
+                choice.get("finish_reason") == "length" and isinstance(content, str) and
+                not re.search(r"<\s*/?\s*think\s*>", content, re.IGNORECASE) and
+                not choice["message"].get("reasoning_content") and not choice["message"].get("reasoning")):
+            # The opening tag was in the prompt and generation never reached its
+            # closing tag. Mark it for the parser so truncated thoughts cannot leak.
+            result = dict(result, choices=[dict(choice, message=dict(choice["message"], content="<think>" + content))])
+        return result
+    finally:
+        if had_override:
+            llm.create_completion = original
+        else:
+            del llm.create_completion
+
+
 class QwenGGUFParameters:
     """A reusable parameter bundle for the inference node."""
 
@@ -361,12 +446,14 @@ class QwenGGUFParameters:
     def INPUT_TYPES(cls):
         return {"required": {
             "enable_thinking": ("BOOLEAN", {"default": False}),
-            "reasoning_budget": ("INT", {"default": -1, "min": -1, "max": 32768}),
+            "reasoning_budget": ("INT", {"default": -1, "min": -1, "max": 32768,
+                "tooltip": "Used when the main thinking_level is custom. 0 disables thinking; -1 removes the thinking budget within the total max_tokens limit."}),
             "inference_mode": (["auto", "one by one", "images", "video"],),
             "max_frames": ("INT", {"default": 24, "min": 1, "max": 1024}),
             "max_size": ("INT", {"default": 256, "min": 0, "max": 4096}),
             "video_fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 240.0, "step": 0.1}),
-            "max_tokens": ("INT", {"default": 1024, "min": 1, "max": 32768}),
+            "max_tokens": ("INT", {"default": 1024, "min": 1, "max": 32768,
+                "tooltip": "Without thinking: total output limit. With a finite thinking budget: final-answer space to reserve; thinking tokens are added to the total limit, subject to context_size."}),
             "top_k": ("INT", {"default": 30, "min": 0, "max": 1000}),
             "top_p": ("FLOAT", {"default": 0.90, "min": 0.0, "max": 1.0, "step": 0.01}),
             "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -415,6 +502,8 @@ class QwenGGUFInference:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffff, "control_after_generate": True}),
                 "enable_thinking": ("BOOLEAN", {"default": False,
                     "tooltip": "Enable model thinking. This main-node switch overrides the Parameters setting."}),
+                "thinking_level": (list(THINKING_LEVELS), {"default": "auto",
+                    "tooltip": "Thinking token budget: low 256, medium 1024, high 4096; auto adapts to max_tokens; custom uses Parameters reasoning_budget. Requires enable_thinking."}),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -431,7 +520,7 @@ class QwenGGUFInference:
     def infer(self, model, mmproj, user_prompt, system_prompt, preset_prompt="Normal - Describe",
               attention_mode="auto", context_size=8192, gpu_layers=99,
               keep_model_loaded=True, seed=0, image=None, video=None, parameters=None,
-              enable_thinking=None):
+              enable_thinking=None, thinking_level=None):
         if parameters is not None and not isinstance(parameters, dict):
             raise TypeError("parameters must come from a Qwen GGUF Parameters node.")
         params = dict(PARAMETER_DEFAULTS)
@@ -444,6 +533,11 @@ class QwenGGUFInference:
         # switch takes precedence whenever supplied by ComfyUI.
         if enable_thinking is not None:
             params["enable_thinking"] = bool(enable_thinking)
+        # Calls from older workflows retain their explicit Parameters budget.
+        level = thinking_level if thinking_level is not None else "custom"
+        budget = _thinking_budget(level, params)
+        if budget == 0:
+            params["enable_thinking"] = False
         if image is not None and video is not None:
             raise ValueError("Connect either image or video input, not both.")
         if params["max_frames"] < 1 or params["max_size"] < 0 or params["video_fps"] < 0:
@@ -483,10 +577,10 @@ class QwenGGUFInference:
             presence_penalty=params["presence_penalty"],
             mirostat_mode=params["mirostat_mode"],
             mirostat_tau=params["mirostat_tau"], mirostat_eta=params["mirostat_eta"],
-            reasoning_budget=params["reasoning_budget"] if params["enable_thinking"] else -1,
             seed=seed,
         )
         results = []
+        thinking_calls = []
         with _LOCK:
             try:
                 llm = _ensure_model(
@@ -509,9 +603,11 @@ class QwenGGUFInference:
                         frame_messages = _messages(system_prompt, frame_prompt, [(index, frame)],
                                                    params["max_size"], frame_rate,
                                                    as_video=is_video_sequence)
-                        frame_result = llm.create_chat_completion(
-                            messages=frame_messages, max_tokens=min(params["max_tokens"], 256),
-                            **completion_options,
+                        frame_budget = min(budget, 64) if budget >= 0 else 64
+                        frame_result = _complete(
+                            llm, frame_messages, completion_options, min(params["max_tokens"], 256),
+                            frame_budget if params["enable_thinking"] else 0,
+                            params["enable_thinking"], thinking_calls, "frame",
                         )
                         results.append(frame_result)
                         observation, _ = _response_parts(frame_result)
@@ -532,8 +628,9 @@ class QwenGGUFInference:
                     messages = _messages(request_system_prompt, prompt, selected,
                                          params["max_size"], frame_rate if mode == "video" else None,
                                          as_video=mode == "video")
-                result = llm.create_chat_completion(
-                    messages=messages, max_tokens=params["max_tokens"], **completion_options,
+                result = _complete(
+                    llm, messages, completion_options, params["max_tokens"], budget,
+                    params["enable_thinking"], thinking_calls, "final",
                 )
                 results.append(result)
                 spec_stats = getattr(llm, "last_speculative_stats", {}) if params["mtp_draft_tokens"] else {}
@@ -548,6 +645,8 @@ class QwenGGUFInference:
                 if isinstance(value, (int, float)):
                     usage[key] = usage.get(key, 0) + value
         stats = {"usage": usage, "mtp": spec_stats, "inference_mode": mode,
+                 "thinking": {"enabled": params["enable_thinking"], "level": level,
+                              "budget_requested": budget, "calls": thinking_calls},
                  "gpu_layers_effective": effective_gpu_layers,
                  "total_frames": int(media.shape[0]) if media is not None else 0,
                  "selected_frames": selected_count, "model_calls": len(results)}
